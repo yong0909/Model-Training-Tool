@@ -1,0 +1,81 @@
+# 本机配置：可能包含私有路径、主机地址和用户名
+/train_panel_defaults.json
+!/train_panel_defaults.example.json
+
+# 原始数据、标注、视频和推理结果
+/images/
+/annotations/
+/seed-images/
+/seed-annotations/
+/test-images/
+/test-annotations/
+/camtest-images/
+/camtest-annotations/
+/videos/
+/qzj_videos/
+/train.txt
+**/predict_results/
+
+# 训练工作区、导出目录和打包产物
+/.maixcam_work_*/
+/outputs_*/
+/maixcam_job_*.zip
+/train_job_*.zip
+
+# 模型权重、转换和校准产物
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.trt
+*.cvimodel
+*.mlir
+*.mud
+*.npz
+*.npy
+*.cali_table
+**/weights/
+**/calib_images/
+
+# 压缩包与运行结果
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+results.csv
+predictions.csv
+
+# Python 与训练环境缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.cache/
+cache/
+logs/
+jobs/
+config/
+environment.json
+train_env.cmd
+train_env.sh
+
+# 本地环境变量与编辑器文件
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+*.tmp
+Thumbs.db
+.DS_Store
+
+#日志
+log.txt
