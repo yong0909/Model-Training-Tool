@@ -10,7 +10,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -54,7 +53,6 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 WORKFLOW_SCRIPT = SCRIPT_ROOT / "host_train_export.py"
 TEST_SCRIPT = SCRIPT_ROOT / "model_test.py"
 LABEL_SCRIPT = SCRIPT_ROOT / "video_track_label.py"
-DEFAULT_VM_WORK_DIR = "~/maixcam_jobs"
 USER_DEFAULTS_FILE = SCRIPT_ROOT / "train_panel_defaults.json"
 STOP_EXPORT_SIGNAL_FILE = SCRIPT_ROOT / ".train_stop_export.signal"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg"}
@@ -87,18 +85,6 @@ DEFAULT_VALUES: dict[str, Any] = {
 
     "project_name": "douzi_yolov8n_448",
     "model_name": "douzi_yolov8n_448",
-    "operator_mode": "recommended",
-    "mud_model_type": "yolov8",
-    "mud_anchors": "",
-    "convert_output_dir": "",
-    "model_path": "",
-    "classes_path": "",
-    "calib_dir": "",
-    "test_image": "",
-    "vm_user": "",
-    "vm_host": "",
-    "vm_work_dir": DEFAULT_VM_WORK_DIR,
-    "skip_vm_convert": False,
     "test_model": "",
     "test_source": "camera",
     "test_image_file": "",
@@ -129,12 +115,6 @@ DEFAULT_VALUES: dict[str, Any] = {
 
 
 STATE_LOCK = threading.RLock()
-JOB_INPUT_LOCK = threading.Lock()
-JOB_AUTH_CONTEXT: dict[str, Any] = {
-    "vm_password": "",
-    "awaiting": "",
-    "prompt": "",
-}
 STATE: dict[str, Any] = {
     "values": DEFAULT_VALUES.copy(),
     "logs": [],
@@ -452,37 +432,6 @@ def append_log(text: str) -> None:
         STATE["logs"].append(text)
         if len(STATE["logs"]) > MAX_LOG_LINES:
             STATE["logs"] = STATE["logs"][-MAX_LOG_LINES:]
-
-
-def update_ssh_prompt(text: str) -> None:
-    normalized = strip_ansi(text).lower()
-    awaiting = ""
-    prompt = ""
-    if "yes/no" in normalized:
-        awaiting = "confirm"
-        prompt = "SSH 正在等待主机指纹确认，请输入 yes。"
-    elif re.search(r"(?:password|密码)\s*:\s*$", normalized):
-        awaiting = "password"
-        prompt = "SSH 正在等待密码。"
-    if not awaiting:
-        return
-    password = ""
-    with STATE_LOCK:
-        if JOB_AUTH_CONTEXT["awaiting"] == awaiting:
-            return
-        JOB_AUTH_CONTEXT["awaiting"] = awaiting
-        JOB_AUTH_CONTEXT["prompt"] = prompt
-        if awaiting == "password":
-            password = str(JOB_AUTH_CONTEXT.get("vm_password") or "")
-    append_log(f"\n[SSH 交互提示] {prompt}\n")
-    if password:
-        try:
-            send_job_input(password, secret=True, automatic=True)
-            with STATE_LOCK:
-                JOB_AUTH_CONTEXT["awaiting"] = ""
-                JOB_AUTH_CONTEXT["prompt"] = ""
-        except RuntimeError:
-            pass
 
 
 def strip_ansi(text: str) -> str:
@@ -897,19 +846,12 @@ def parse_train_output(line: str) -> None:
 
 def parse_marker(line: str) -> None:
     markers = {
-        "TRAIN_MODEL_ONNX=": "model_path",
+        "TRAIN_MODEL_ONNX=": "train_model_onnx",
         "TRAIN_PLOT_DIR=": "train_plot_dir",
-        "TRAIN_CLASSES=": "classes_path",
-        "TRAIN_CALIB_DIR=": "calib_dir",
-        "TRAIN_TEST_IMAGE=": "test_image",
         "TRAIN_MODEL_PT=": "test_model",
         "TRAIN_STOP_EXPORT_REQUESTED=": "stop_export",
         "TEST_OUTPUT_IMAGE=": "test_output_image",
 
-        "CONVERT_FINAL_TAR=": "convert_final_tar",
-        "CONVERT_FINAL_DIR=": "convert_final_dir",
-        "CONVERT_PACKAGE=": "convert_package",
-        "CONVERT_WORK_DIR=": "convert_work_dir",
     }
     with STATE_LOCK:
         for prefix, key in markers.items():
@@ -918,8 +860,6 @@ def parse_marker(line: str) -> None:
                 STATE["markers"][key] = value
                 if key in STATE["values"]:
                     STATE["values"][key] = value
-                if key == "test_model" and not STATE["values"].get("model_path"):
-                    STATE["values"]["model_path"] = value
                 return
 
 
@@ -950,29 +890,11 @@ def build_common_args(values: dict[str, Any], stage: str) -> list[Any]:
 
 
         "--model-name", values["model_name"],
-        "--operator-mode", values["operator_mode"],
-        "--vm-user", values["vm_user"],
-        "--vm-host", values["vm_host"],
-        "--vm-work-dir", values["vm_work_dir"],
     ]
 
 
 def build_train_cmd(values: dict[str, Any]) -> list[Any]:
     return build_common_args(values, "train")
-
-
-def build_convert_cmd(values: dict[str, Any]) -> list[Any]:
-    cmd = build_common_args(values, "convert") + [
-        "--mud-model-type", values["mud_model_type"],
-        "--mud-anchors", values["mud_anchors"],
-        "--model-path", values["model_path"],
-        "--classes-path", values["classes_path"],
-        "--calib-dir", values["calib_dir"],
-        "--test-image", values["test_image"],
-    ]
-    if as_bool(values["skip_vm_convert"]):
-        cmd.append("--skip-vm-convert")
-    return cmd
 
 
 def build_test_cmd(values: dict[str, Any]) -> list[Any]:
@@ -1023,14 +945,10 @@ def command_for(action: str, values: dict[str, Any]) -> list[Any]:
 
     if action == "train":
         return build_train_cmd(values)
-    if action == "convert":
-        return build_convert_cmd(values)
     if action == "test":
         return build_test_cmd(values)
     if action == "label":
         return build_label_cmd(values)
-    if action == "vm_ssh":
-        return ["ssh", f"{values['vm_user']}@{values['vm_host']}", "hostname"]
     raise ValueError(f"unknown action: {action}")
 
 
@@ -1058,29 +976,11 @@ def validate(action: str, values: dict[str, Any]) -> None:
         for key, label in (("img_width", "图片宽度"), ("img_height", "图片高度")):
             value = parse_int(str(values.get(key, "")))
             if value is None or value < 32 or value % 32:
-                raise ValueError(f"{label}必须是大于等于 32 的 32 倍数，以兼容 YOLO 和 MaixCAM 转换。")
+                raise ValueError(f"{label}必须是大于等于 32 的 32 倍数。")
         if values.get("image_resize_mode") not in {"crop", "letterbox", "stretch"}:
             raise ValueError("图片适配方式必须为裁剪、等比缩放或拉伸。")
         if not WORKFLOW_SCRIPT.exists():
             raise ValueError(f"未找到 host_train_export.py: {WORKFLOW_SCRIPT}")
-    elif action == "convert":
-        if values.get("train_task") == "classify":
-            raise ValueError("当前 MaixCAM 转换流程仅支持目标检测 ONNX。请回到“训练配置”，把“训练任务”切换为“目标检测（图片 + XML 标注）”；分类模型训练完成后可直接使用 .pt 或 .onnx。")
-        for key, label in (("model_path", "ONNX 模型"), ("classes_path", "classes.txt"), ("calib_dir", "校准图片目录"), ("mud_model_type", "MUD Model Type")):
-            if not values[key].strip():
-                raise ValueError(f"{label} 不能为空。")
-        mud_model_type = values["mud_model_type"].strip().lower()
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", mud_model_type):
-            raise ValueError("MUD Model Type 仅支持字母、数字、下划线、连字符和点。")
-        anchors = values["mud_anchors"].strip()
-        if anchors and not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", anchors):
-            raise ValueError("MUD Anchors 必须是以英文逗号分隔的非负整数，例如 10, 13, 16, 30。")
-        if mud_model_type == "yolov5":
-            if not anchors:
-                raise ValueError("YOLOv5 的 MUD Anchors 不能为空；请填写训练/导出配置中实际使用的 anchors。")
-            anchor_values = [int(item.strip()) for item in anchors.split(",")]
-            if len(anchor_values) % 2 or len(anchor_values) < 2:
-                raise ValueError("YOLOv5 的 MUD Anchors 必须包含成对的宽、高整数。")
     elif action == "test":
         if not TEST_SCRIPT.exists():
             raise ValueError(f"未找到 model_test.py: {TEST_SCRIPT}")
@@ -1106,28 +1006,18 @@ def validate(action: str, values: dict[str, Any]) -> None:
             raise ValueError("请先从视频队列选择或填写视频路径。")
         if not values["label_name"].strip():
             raise ValueError("请先填写至少一个标签名称。")
-    elif action == "vm_ssh":
-        if not values["vm_user"].strip() or not values["vm_host"].strip():
-            raise ValueError("请先填写 VM User 和 VM Host/IP。")
 
 
-def start_job(action: str, values: dict[str, Any], vm_password: str = "", vm_private_key: str = "") -> None:
+def start_job(action: str, values: dict[str, Any]) -> None:
     global current_proc, stop_requested
 
     validate(action, values)
     cmd = command_for(action, values)
-    session_password = vm_password if action in {"convert", "vm_ssh"} else ""
-    session_private_key = vm_private_key if action in {"convert", "vm_ssh"} else ""
-    if action in {"convert", "vm_ssh"} and not session_password and not session_private_key:
-        raise ValueError("请输入密码或导入私钥。")
     with STATE_LOCK:
         if STATE["running"]:
             raise RuntimeError("已有任务正在运行，请等待完成或先停止。")
         current_proc = None
         stop_requested = False
-        JOB_AUTH_CONTEXT["vm_password"] = session_password
-        JOB_AUTH_CONTEXT["awaiting"] = ""
-        JOB_AUTH_CONTEXT["prompt"] = ""
         STATE["values"] = values.copy()
         STATE["logs"] = []
         STATE["running"] = True
@@ -1152,26 +1042,9 @@ def start_job(action: str, values: dict[str, Any], vm_password: str = "", vm_pri
         global current_proc, stop_requested
 
         proc: Optional[subprocess.Popen[Any]] = None
-        private_key_path: Optional[Path] = None
         try:
             process_env = subprocess_env()
             process_cmd = list(cmd)
-            if session_password:
-                process_env["MAIXCAM_VM_SSH_PASSWORD"] = session_password
-            if session_private_key:
-                fd, private_key_name = tempfile.mkstemp(prefix="maixcam_vm_key_", suffix=".key")
-                os.close(fd)
-                private_key_path = Path(private_key_name)
-                try:
-                    private_key_path.write_text(session_private_key, encoding="utf-8", newline="")
-                    os.chmod(private_key_path, 0o600)
-                except Exception:
-                    private_key_path.unlink(missing_ok=True)
-                    raise
-                if action == "convert":
-                    process_cmd += ["--vm-private-key", str(private_key_path)]
-                elif action == "vm_ssh":
-                    process_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(private_key_path), f"{values['vm_user']}@{values['vm_host']}", "hostname"]
             append_log("$ " + quote_cmd(cmd) + "\n")
             proc = subprocess.Popen(
                 [str(x) for x in process_cmd],
@@ -1199,15 +1072,10 @@ def start_job(action: str, values: dict[str, Any], vm_password: str = "", vm_pri
                     buffer.extend(chunk)
                     preview = decode_process_output(bytes(buffer))
                     is_boundary = chunk in (b"\n", b"\r")
-                    is_ssh_prompt = (
-                        "yes/no" in strip_ansi(preview).lower()
-                        or bool(re.search(r"(?:password|密码)\s*:\s*$", strip_ansi(preview), re.IGNORECASE))
-                    )
-                    if is_boundary or is_ssh_prompt or len(buffer) >= 256:
+                    if is_boundary or len(buffer) >= 256:
                         line = preview
                         buffer.clear()
                         append_log(line)
-                        update_ssh_prompt(line)
                         if is_boundary:
                             parse_marker(line.strip())
                             if action == "train":
@@ -1215,7 +1083,6 @@ def start_job(action: str, values: dict[str, Any], vm_password: str = "", vm_pri
                 if buffer:
                     line = decode_process_output(bytes(buffer))
                     append_log(line)
-                    update_ssh_prompt(line)
                     parse_marker(line.strip())
                     if action == "train":
                         parse_train_output(line)
@@ -1239,62 +1106,14 @@ def start_job(action: str, values: dict[str, Any], vm_password: str = "", vm_pri
             else:
                 append_log(f"\n[error] {exc}\n")
         finally:
-            if private_key_path:
-                private_key_path.unlink(missing_ok=True)
             with STATE_LOCK:
                 STATE["running"] = False
                 STATE["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 current_proc = None
                 stop_requested = False
-                JOB_AUTH_CONTEXT["vm_password"] = ""
-                JOB_AUTH_CONTEXT["awaiting"] = ""
-                JOB_AUTH_CONTEXT["prompt"] = ""
 
 
     threading.Thread(target=worker, daemon=True).start()
-
-
-def stop_train_and_export() -> bool:
-    with STATE_LOCK:
-        if not STATE["running"] or STATE.get("job") != "train":
-            return False
-        values = STATE["values"].copy()
-        markers = STATE["markers"].copy()
-        STATE["markers"]["stop_export"] = "已请求停止训练并导出当前 best 模型"
-        STATE["train_progress"]["phase"] = "export"
-        STATE["train_progress"]["updated_at"] = time.strftime("%H:%M:%S")
-
-    append_log("\n[stop training and export requested]\n")
-    try:
-        STOP_EXPORT_SIGNAL_FILE.write_text(str(time.time()), encoding="utf-8")
-    except OSError as exc:
-        append_log(f"[stop export signal error] {exc}\n")
-    return True
-
-
-def send_job_input(text: str, secret: bool = False, automatic: bool = False) -> None:
-    value = str(text).replace("\r", "").replace("\n", "")
-    if not value:
-        raise ValueError("请输入要发送的内容。")
-    if len(value) > 4096:
-        raise ValueError("单次输入不能超过 4096 个字符。")
-
-    with STATE_LOCK:
-        proc = current_proc
-        running = STATE["running"]
-    if not running or proc is None or proc.poll() is not None or proc.stdin is None:
-        raise RuntimeError("当前没有可接收输入的运行任务。")
-
-    try:
-        with JOB_INPUT_LOCK:
-            proc.stdin.write((value + "\n").encode("utf-8"))
-            proc.stdin.flush()
-    except (BrokenPipeError, OSError, ValueError) as exc:
-        raise RuntimeError("任务已结束，无法发送输入。") from exc
-    with STATE_LOCK:
-        JOB_AUTH_CONTEXT["awaiting"] = ""
-        JOB_AUTH_CONTEXT["prompt"] = ""
-    append_log(">>> [已自动发送密码]\n" if secret and automatic else ">>> [已发送密码]\n" if secret else f">>> {value}\n")
 
 
 def stop_job() -> bool:
@@ -1738,37 +1557,6 @@ def pick_directory(initial_dir: str = "", title: str = "选择文件夹") -> str
     return selected
 
 
-def detect_convert_output_files(output_dir: str) -> dict[str, str]:
-    root = Path(output_dir).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError("请选择有效的标准训练输出文件夹。")
-    if not re.fullmatch(r"outputs_\d{8}_\d{6}", root.name):
-        raise ValueError("请选择名称形如 outputs_YYYYMMDD_HHMMSS 的标准训练输出文件夹。")
-    onnx_files = sorted(path for path in root.glob("*.onnx") if path.is_file())
-    if len(onnx_files) != 1:
-        detail = "未找到" if not onnx_files else f"找到 {len(onnx_files)} 个"
-        raise ValueError(f"{root.name} 中{detail} ONNX 模型，无法自动识别。")
-    classes_path = root / "classes.txt"
-    calib_dir = root / "calib_images"
-    test_image = root / "test.jpg"
-    missing = []
-    if not classes_path.is_file():
-        missing.append("classes.txt")
-    if not calib_dir.is_dir():
-        missing.append("calib_images")
-    if not test_image.is_file():
-        missing.append("test.jpg")
-    if missing:
-        raise ValueError(f"{root.name} 不是完整的标准训练输出文件夹，缺少：{', '.join(missing)}。")
-    return {
-        "convert_output_dir": str(root),
-        "model_path": str(onnx_files[0]),
-        "classes_path": str(classes_path),
-        "calib_dir": str(calib_dir),
-        "test_image": str(test_image),
-    }
-
-
 def read_video_preview_frame(video_path: Path):
     backends = [cv2.CAP_ANY]
     if hasattr(cv2, "CAP_FFMPEG"):
@@ -1932,13 +1720,13 @@ HTML_PAGE = r'''<!doctype html>
       <div class="eyebrow"><span class="dot"></span> Web 面板运行于 8989 端口</div>
 
       <h1>model-training-tool</h1>
-      <p class="subtitle">按“准备数据 → 训练模型 → 转换模型 → 测试效果”的顺序完成流程。训练完成后，面板会自动回填 ONNX、classes、校准图和测试模型路径，减少手动复制。</p>
+      <p class="subtitle">按“准备数据 → 训练模型 → 测试效果”的顺序完成流程。</p>
     </div>
     <div class="card guide">
       <div class="steps">
         <div class="step"><div class="num">1</div><div><b>确认数据集</b><span>分别填写图片目录、XML 标注目录和输出根目录。</span></div></div>
         <div class="step"><div class="num">2</div><div><b>配置本机训练</b><span>选择数据目录、模型和训练参数。</span></div></div>
-        <div class="step"><div class="num">3</div><div><b>转换与测试</b><span>训练标记会自动填入转换参数，随后上传 VM 转 MaixCAM 包。</span></div></div>
+        <div class="step"><div class="num">3</div><div><b>测试效果</b><span>使用训练生成的 .pt 模型进行摄像头、单图或图片目录推理。</span></div></div>
       </div>
     </div>
   </div>
@@ -1947,10 +1735,9 @@ HTML_PAGE = r'''<!doctype html>
     <aside class="card side">
       <div class="nav">
         <button data-tab="train" class="active">训练配置 <span>01</span></button>
-        <button data-tab="convert">模型转换 <span>02</span></button>
-        <button data-tab="test">模型测试 <span>03</span></button>
-        <button data-tab="label">视频打标 <span>04</span></button>
-        <button data-tab="logs">运行日志 <span>05</span></button>
+        <button data-tab="test">模型测试 <span>02</span></button>
+        <button data-tab="label">视频打标 <span>03</span></button>
+        <button data-tab="logs">运行日志 <span>04</span></button>
 
       </div>
       <div class="status">
@@ -1984,7 +1771,6 @@ HTML_PAGE = r'''<!doctype html>
           <div class="field sm"><label>Epochs</label><input id="epochs"></div>
           <div class="field sm"><label>Batch</label><input id="batch"></div>
           <div class="field sm"><label>Lr0</label><input id="lr0"></div>
-          <div class="field"><label>Operator Mode</label><div class="choice"><label><input name="operator_mode" type="radio" value="recommended"><span>推荐算子</span></label><label><input name="operator_mode" type="radio" value="maixcam"><span>仅 MaixCAM 支持</span></label></div></div>
         </div>
         <div class="train-board">
           <div class="progress-card wide">
@@ -2041,28 +1827,6 @@ HTML_PAGE = r'''<!doctype html>
           </div>
         </div>
         <div class="cmd" id="cmd-train"></div>
-      </section>
-
-      <section id="tab-convert" class="tab card section">
-        <h2>模型转换</h2><p class="hint">训练结束后路径会自动回填。也可选择标准 <code>outputs_YYYYMMDD_HHMMSS</code> 文件夹，自动识别 ONNX、classes.txt、校准图片和测试图。</p>
-        <div class="grid">
-          <div class="field full"><label>标准训练输出文件夹</label><div class="input-action"><input id="convert_output_dir" placeholder="例如 E:/vscode_workspace/myAUTOtrain/outputs_20260726_104847"><button class="btn" onclick="pickConvertOutputDir()">选择并识别</button></div></div>
-          <div class="field full"><label>ONNX Model</label><input id="model_path"></div>
-          <div class="field"><label>Classes</label><input id="classes_path"></div>
-          <div class="field"><label>Calib Images</label><input id="calib_dir"></div>
-          <div class="field"><label>Test Image</label><input id="test_image"></div>
-          <div class="field"><label>MUD Model Type</label><input id="mud_model_type" placeholder="例如 yolov8 或 yolov5"><div class="mini">必须与设备端实际调用的类一致：<code>nn.YOLOv8</code> 对应 <code>yolov8</code>，<code>nn.YOLOv5</code> 对应 <code>yolov5</code>。当前工具以 Ultralytics 导出 ONNX；无锚框 Detect 头必须选 <code>yolov8</code>，并由新版转换脚本导出 DFL + 分类 Sigmoid 两路输出。</div></div>
-          <div class="field"><label>MUD Anchors（仅传统锚框 YOLOv5 MUD）</label><input id="mud_anchors" placeholder="传统 YOLOv5 才填写，例如 10, 13, 16, 30, ..."><div class="mini">仅当设备端使用 <code>nn.YOLOv5</code>，且 ONNX/转换模型确实为传统锚框 YOLOv5 时填写。若使用 <code>nn.YOLOv8</code>，保持为空；训练基础权重名称不是判断依据。</div></div>
-          <div class="field"><label>VM User</label><input id="vm_user"></div>
-          <div class="field"><label>VM Host/IP</label><input id="vm_host"></div>
-          <div class="field"><label>VM Password（可选）</label><input id="vm_password" type="password" autocomplete="new-password" placeholder="仅本次任务使用"><div class="mini">与私钥二选一；不会保存到默认配置、命令或日志。</div></div>
-          <div class="field"><label>VM SSH 私钥（可选）</label><input id="vm_private_key" type="file" accept=".pem,.key,.ppk,.rsa,*/*"><div class="mini">导入 OpenSSH 私钥；仅本次任务使用，任务结束后立即删除临时副本。</div></div>
-          <div class="field full"><div class="mini">首次连接此 VM 前，请先在 Linux 终端执行 <code>ssh VM用户@VM主机IP</code>，确认目标无误后输入 <code>yes</code>，再输入 VM 密码并成功登录；执行 <code>exit</code> 返回终端后，再在面板开始转换。主机指纹会保存到当前用户的 <code>.ssh/known_hosts</code>。</div></div>
-          <div class="field full"><label>VM Work Dir</label><input id="vm_work_dir"></div>
-          <div class="field full"><div class="choice"><label><input id="skip_vm_convert" type="checkbox"><span>只上传转换包，跳过 VM 转换</span></label></div></div>
-        </div>
-        <div class="actions"><div class="btns"><button class="btn" onclick="runAction('vm_ssh')">测试 VM SSH</button><button class="btn" onclick="copyCommand('convert')">复制转换命令</button><button class="btn" onclick="saveDefaults('模型转换')">存为默认</button></div><button class="btn blue" onclick="runAction('convert')">开始转换</button></div>
-        <div class="cmd" id="cmd-convert"></div>
       </section>
 
       <section id="tab-test" class="tab card section">
@@ -2176,9 +1940,8 @@ HTML_PAGE = r'''<!doctype html>
 
 
       <section id="tab-logs" class="tab card section">
-        <h2>运行日志</h2><p class="hint">这里实时显示训练、转换、SSH 测试、模型测试和视频打标输出。SSH 要求确认时输入 <code>yes</code>；要求密码时勾选“密码输入”后发送，密码不会写入日志。</p>
+        <h2>运行日志</h2><p class="hint">这里实时显示训练、模型测试和视频打标输出。</p>
         <div class="actions"><div class="btns"><button class="btn" onclick="refreshState()">刷新</button><button class="btn" onclick="copyLogs()">复制日志</button></div><button class="btn red" onclick="stopJob()">停止当前任务</button></div>
-        <div class="actions log-input-actions"><input id="job-input" type="text" autocomplete="off" placeholder="输入 yes、密码或其他交互内容" onkeydown="if(event.key==='Enter')sendJobInput()"><label class="hint job-input-secret-label"><input id="job-input-secret" type="checkbox" onchange="updateJobInputMode()"><span>密码输入（不回显日志）</span></label><button class="btn primary" onclick="sendJobInput()">发送</button></div>
         <div class="log" id="log"></div>
       </section>
 
@@ -2187,7 +1950,7 @@ HTML_PAGE = r'''<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','train_ratio_percent','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','convert_output_dir','model_path','classes_path','calib_dir','test_image','mud_model_type','mud_anchors','vm_user','vm_host','vm_work_dir','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
+const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','train_ratio_percent','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
 
 
 
@@ -2213,12 +1976,12 @@ function updateTrainProgress(p){p=p||{}; const task=p.task||document.querySelect
 function updateTrainTaskUI(){const task=document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const annotations=document.getElementById('annotations-field'); const hint=document.getElementById('train-task-hint'); if(annotations) annotations.hidden=task==='classify'; if(hint) hint.textContent=task==='classify'?'分类数据集结构：Images Dir/类别名/图片。每个类别至少 2 张图片；Annotations Dir 不参与分类训练；Base Model 请使用分类权重，例如 yolo11n-cls.pt。':'检测数据集结构：Images Dir 与 Annotations Dir 中的同名图片、XML 一一对应。'}
 function syncLabelFields(prefix,toCanonical){const pairs=prefix==='camera'?[['label_name_camera','label_name'],['label_prefix_camera','label_prefix'],['label_images_dir_camera','label_images_dir'],['label_annotations_dir_camera','label_annotations_dir'],['label_tracker_camera','label_tracker'],['label_interval_camera','label_interval'],['label_max_frames_camera','label_max_frames'],['label_display_scale_camera','label_display_scale'],['label_jpeg_quality_camera','label_jpeg_quality']]:[['label_name_images','label_name'],['label_annotations_dir_images','label_annotations_dir'],['label_tracker_images','label_tracker'],['label_interval_images','label_interval'],['label_start_frame_images','label_start_frame'],['label_max_frames_images','label_max_frames'],['label_display_scale_images','label_display_scale']]; for(const [sourceId,canonicalId] of pairs){const from=document.getElementById(toCanonical?sourceId:canonicalId); const to=document.getElementById(toCanonical?canonicalId:sourceId); if(from&&to) to.value=from.value}}
 function updateLabelSourceUI(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; const video=document.getElementById('label-video-source'); const camera=document.getElementById('label-camera-source'); const images=document.getElementById('label-images-source'); const start=document.getElementById('label-start-button'); if(video) video.hidden=source!=='video'; if(camera) camera.hidden=source!=='camera'; if(images) images.hidden=source!=='images'; if(source==='camera') syncLabelFields('camera',false); if(source==='images') syncLabelFields('images',false); if(start) start.textContent=source==='camera'?'在网页中开始摄像头标注':source==='images'?'在网页中开始图片集标注':'在网页中开始视频标注'}
-function collect(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; if(source==='camera') syncLabelFields('camera',true); if(source==='images') syncLabelFields('images',true); for(const id of fields){const el=document.getElementById(id); if(el) values[id]=el.value} values.skip_vm_convert=document.getElementById('skip_vm_convert').checked; for(const n of ['operator_mode','train_device','train_task','test_source','label_source_type']){const el=document.querySelector(`input[name="${n}"]:checked`); if(el) values[n]=el.value} return values}
+function collect(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; if(source==='camera') syncLabelFields('camera',true); if(source==='images') syncLabelFields('images',true); for(const id of fields){const el=document.getElementById(id); if(el) values[id]=el.value} for(const n of ['train_device','train_task','test_source','label_source_type']){const el=document.querySelector(`input[name="${n}"]:checked`); if(el) values[n]=el.value} return values}
 function resourceEstimateKey(v){return [v.train_task||'detect',v.train_images_dir||'',v.base_model||'',v.img_width||'',v.img_height||'',v.image_resize_mode||'',v.batch||'',v.train_cache||'',v.train_device||''].join('|')}
 function showResourceEstimate(e){e=e||{}; setText('estimate-images',e.image_count!==undefined?`${e.image_count} 张`:'-'); setText('estimate-ram',e.ram_text||'-'); setText('estimate-vram',e.vram_text||'-'); setText('estimate-cache',e.cache_text||'-'); setText('estimate-imgsz',e.img_size||'-'); setText('estimate-batch',e.batch||'-'); const riskMap={safe:'资源预估',warning:'资源预估 · 警告',danger:'资源预估 · 风险'}; const model=e.model_size?` · YOLO-${e.model_size}`:''; setText('resource-note',`${riskMap[e.risk]||'资源预估'}${model} · cache=${e.cache_mode||'-'}`); setText('resource-detail',e.note||'估算值仅供参考，实际峰值会随模型、增强策略、驱动和环境波动。')}
 async function updateResourceEstimate(){try{const v=collect(); const key=resourceEstimateKey(v); if(key===lastResourceEstimateKey) return; lastResourceEstimateKey=key; setText('resource-note','正在估算...'); const j=await api('/api/train-estimate',{values:v}); showResourceEstimate(j.estimate||{})}catch(e){setText('resource-note','估算失败'); setText('resource-detail',e.message)}}
 function scheduleResourceEstimate(){clearTimeout(resourceEstimateTimer); resourceEstimateTimer=setTimeout(updateResourceEstimate,450)}
-function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); document.getElementById('skip_vm_convert').checked=!!values.skip_vm_convert; for(const n of ['operator_mode','train_device','train_task','test_source','label_source_type']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateLabelSourceUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
+function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); for(const n of ['train_device','train_task','test_source','label_source_type']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateLabelSourceUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
 
 
 async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); const j=await r.json(); if(!r.ok||j.error) throw new Error(j.error||r.statusText); return j}
@@ -2226,7 +1989,7 @@ let valuesSaveQueue=Promise.resolve();
 function saveValues(){const snapshot={...collect()}; valuesSaveQueue=valuesSaveQueue.then(()=>api('/api/values',{values:snapshot})).catch(()=>{}); return valuesSaveQueue}
 async function saveDefaults(scope){const snapshot={...collect()}; try{await valuesSaveQueue; const j=await api('/api/defaults',{values:snapshot}); apply(j.values||{}); toast(`${scope||'当前配置'}已保存为默认`)}catch(e){toast(e.message)}}
 async function command(action){const j=await api('/api/command',{action,values:collect()}); return j.command}
-async function updateCommands(){try{document.getElementById('cmd-train').textContent=await command('train');document.getElementById('cmd-convert').textContent=await command('convert');document.getElementById('cmd-test').textContent=await command('test');document.getElementById('cmd-label').textContent=await command('label')}catch(e){}}
+async function updateCommands(){try{document.getElementById('cmd-train').textContent=await command('train');document.getElementById('cmd-test').textContent=await command('test');document.getElementById('cmd-label').textContent=await command('label')}catch(e){}}
 function setInputValue(id,value){const el=document.getElementById(id); if(el){el.value=value; values[id]=value}}
 function videoPrefix(video){return video.stem.replace(/[^\w\u4e00-\u9fa5-]+/g,'_').replace(/^_+|_+$/g,'')||'track'}
 function videoUrl(video,path='/api/video-file'){return `${path}?path=${encodeURIComponent(video.path)}&t=${Date.now()}`}
@@ -2238,7 +2001,6 @@ function renderLabelVideos(){const list=document.getElementById('label-video-lis
 function selectLabelVideo(index){if(index<0||index>=labelVideos.length) return; labelVideoIndex=index; if(index>=labelVisibleCount){labelVisibleCount=Math.min(labelVideos.length,Math.ceil((index+1)/LABEL_VIDEO_PAGE_SIZE)*LABEL_VIDEO_PAGE_SIZE)} const video=labelVideos[index]; setInputValue('label_video',video.path); if(!rawLabelPrefix.manual){setInputValue('label_prefix',videoPrefix(video))} renderLabelVideos(); updateVideoPreview(video); saveValues(); updateCommands()}
 async function loadLabelVideos(){try{await saveValues(); const list=document.getElementById('label-video-list'); if(list) list.innerHTML='<div class="empty">正在读取视频文件夹，请稍候...</div>'; const r=await fetch('/api/label-videos'); const j=await r.json(); if(j.error) throw new Error(j.error); labelVideos=j.items||[]; labelVisibleCount=LABEL_VIDEO_PAGE_SIZE; const current=(document.getElementById('label_video')?.value||'').trim(); labelVideoIndex=labelVideos.findIndex(v=>v.path===current); if(labelVideoIndex<0&&labelVideos.length) labelVideoIndex=0; if(labelVideos.length) selectLabelVideo(labelVideoIndex); else renderLabelVideos(); toast(`已读取 ${labelVideos.length} 个视频${labelVideos.length>=2000?'，已自动限制前 2000 个':''}`)}catch(e){toast(e.message)}}
 
-async function pickConvertOutputDir(){try{const j=await api('/api/pick-convert-output-dir',{values:collect()}); if(j.values){apply(j.values); await saveValues(); toast('已识别并填入 ONNX、classes、校准图片和测试图')}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
 async function pickTestImage(){try{const j=await api('/api/pick-test-image',{values:collect()}); if(j.path){setInputValue('test_image_file',j.path); await saveValues(); updateCommands()}else{toast('未选择图片')}}catch(e){toast(e.message)}}
 async function pickTestImageFolder(){try{const j=await api('/api/pick-test-image-folder',{values:collect()}); if(j.path){setInputValue('test_image_folder',j.path); await saveValues(); updateCommands()}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
 async function pickTestOutputDir(){try{const j=await api('/api/pick-test-output-dir',{values:collect()}); if(j.path){setInputValue('test_output_dir',j.path); await saveValues(); updateCommands()}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
@@ -2247,7 +2009,7 @@ async function pickLabelImagesDir(){try{const j=await api('/api/pick-label-image
 function selectNextVideo(){if(!labelVideos.length){toast('请先读取文件夹视频'); return} if(labelVideoIndex>=0&&labelVideos[labelVideoIndex]) labelVideos[labelVideoIndex].done=true; const next=Math.min(labelVideos.length-1,labelVideoIndex+1); selectLabelVideo(next); toast(next===labelVideos.length-1?'已到最后一个视频':'已切换到下一个视频')}
 
 function selectPrevVideo(){if(!labelVideos.length){toast('请先读取文件夹视频'); return} selectLabelVideo(Math.max(0,labelVideoIndex-1))}
-let labelSessionId=sessionStorage.getItem('maixcamLabelSessionId')||'';
+let labelSessionId=sessionStorage.getItem('labelSessionId')||'';
 let labelSessionState=null;
 let labelPlaying=false;
 let labelAdvanceBusy=false;
@@ -2273,7 +2035,7 @@ function closeLabelChoice(value=''){const dialog=document.getElementById('label-
 function chooseBrowserLabel(){const labels=(labelSessionState?.labels||[]); const choices=labels.length?labels:(collect().label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean); if(choices.length===1) return Promise.resolve(choices[0]); return new Promise(resolve=>{const dialog=document.getElementById('label-choice-dialog'); const options=document.getElementById('label-choice-options'); const cancel=document.getElementById('label-choice-cancel'); if(!dialog||!options){resolve('');return} labelChoiceResolver=resolve; options.innerHTML=''; choices.forEach((label,index)=>{const button=document.createElement('button'); button.type='button'; button.className='label-choice-option'; button.innerHTML=`<span class="label-choice-option-key">${index<9?index+1:''}</span>`; const text=document.createElement('span'); text.textContent=label; button.appendChild(text); button.onclick=()=>closeLabelChoice(label); options.appendChild(button)}); cancel.onclick=()=>closeLabelChoice(''); dialog.onclick=event=>{if(event.target===dialog) closeLabelChoice('')}; dialog.onkeydown=event=>{if(event.key==='Escape'){event.preventDefault();closeLabelChoice('');return} const index=Number(event.key)-1; if(Number.isInteger(index)&&index>=0&&index<choices.length){event.preventDefault();closeLabelChoice(choices[index])}}; dialog.hidden=false; document.body.style.overflow='hidden'; requestAnimationFrame(()=>options.querySelector('button')?.focus())})}
 function setLabelDrawMode(mode){if(!labelSessionId){toast('请先开始网页标注');return} if((mode==='edit'||mode==='sample')&&!labelActiveObjectId){toast('请先在右侧选择目标');return} if(mode==='sample'&&labelSessionState?.tracker!=='multi_template'){toast('追加视角需要先选择 Multi-template（多角度）跟踪器');return} labelDrawMode=mode; toast(mode==='edit'?'请拖动绘制选中目标的新框':mode==='sample'?'请拖动绘制该目标在新角度下的框':'请拖动绘制新目标框')}
 
-async function startBrowserLabelSession(){const v=collect(); if(v.label_source_type==='images'&&!v.label_images_input_dir.trim()){toast('请填写图片集文件夹路径');return} if(v.label_source_type==='camera'&&!/^\d+$/.test(v.label_camera_index.trim())){toast('请输入非负整数摄像头索引，例如 0');return} if(v.label_source_type==='video'&&!v.label_video.trim()){toast('请先从队列选择视频或填写视频路径');return} if(labelSessionId) await endBrowserLabelSession(); try{const j=await api('/api/label-session/start',{values:v}); labelSessionId=j.state.session_id; sessionStorage.setItem('maixcamLabelSessionId',labelSessionId); labelSessionState={...j.state,labels:(v.label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean)}; labelActiveObjectId=null; labelHiddenObjectIds.clear(); labelPlaying=false; showLabelStudio(true); setupLabelTimeline(); setupLabelCanvas(); renderLabelSession(); refreshLabelFrame(); toast('网页标注已就绪，请添加目标框')}catch(e){toast(e.message)}}
+async function startBrowserLabelSession(){const v=collect(); if(v.label_source_type==='images'&&!v.label_images_input_dir.trim()){toast('请填写图片集文件夹路径');return} if(v.label_source_type==='camera'&&!/^\d+$/.test(v.label_camera_index.trim())){toast('请输入非负整数摄像头索引，例如 0');return} if(v.label_source_type==='video'&&!v.label_video.trim()){toast('请先从队列选择视频或填写视频路径');return} if(labelSessionId) await endBrowserLabelSession(); try{const j=await api('/api/label-session/start',{values:v}); labelSessionId=j.state.session_id; sessionStorage.setItem('labelSessionId',labelSessionId); labelSessionState={...j.state,labels:(v.label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean)}; labelActiveObjectId=null; labelHiddenObjectIds.clear(); labelPlaying=false; showLabelStudio(true); setupLabelTimeline(); setupLabelCanvas(); renderLabelSession(); refreshLabelFrame(); toast('网页标注已就绪，请添加目标框')}catch(e){toast(e.message)}}
 async function advanceBrowserLabelFrame(){if(!labelSessionId||labelAdvanceBusy) return; labelAdvanceBusy=true; try{const j=await api('/api/label-session/advance',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(labelSessionState.lost||labelSessionState.ended) stopBrowserLabelPlay(); renderLabelSession(); refreshLabelFrame()}catch(e){stopBrowserLabelPlay();toast(e.message)}finally{labelAdvanceBusy=false}}
 async function seekBrowserLabelFrame(frameIndex){if(!labelSessionId||labelAdvanceBusy||labelSessionState?.source_type!=='video') return; labelAdvanceBusy=true; stopBrowserLabelPlay(); try{const j=await api('/api/label-session/seek',{session_id:labelSessionId,frame_index:frameIndex}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; labelActiveObjectId=labelSessionState.objects[0]?.id||null; renderLabelSession(); refreshLabelFrame(); toast('已跳转到指定帧，请修正目标框后继续')}catch(e){toast(e.message)}finally{labelAdvanceBusy=false}}
 function toggleBrowserLabelPlay(){if(labelPlaying) stopBrowserLabelPlay();else startBrowserLabelPlay()}
@@ -2281,14 +2043,12 @@ function startBrowserLabelPlay(){if(!labelSessionId){toast('请先开始网页�
 function stopBrowserLabelPlay(){labelPlaying=false;clearTimeout(labelPlayTimer);labelPlayTimer=null;renderLabelSession()}
 async function saveBrowserLabelFrame(){if(!labelSessionId) return; try{const j=await api('/api/label-session/save',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; renderLabelSession(); if(j.saved){toast('当前帧已保存');loadLabelResults()}else toast('没有可保存的有效目标框')}catch(e){toast(e.message)}}
 async function deleteBrowserLabelObject(){if(!labelSessionId||!labelActiveObjectId){toast('请先选择目标');return} try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:'delete',object_id:labelActiveObjectId,bbox:{x:0,y:0,w:3,h:3}}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; labelActiveObjectId=labelSessionState.objects[0]?.id||null; renderLabelSession()}catch(e){toast(e.message)}}
-async function endBrowserLabelSession(){stopBrowserLabelPlay(); if(!labelSessionId){showLabelStudio(false);return} try{await api('/api/label-session/end',{session_id:labelSessionId})}catch(e){} labelSessionId='';labelSessionState=null;labelActiveObjectId=null;labelHiddenObjectIds.clear();sessionStorage.removeItem('maixcamLabelSessionId');showLabelStudio(false);loadLabelResults()}
+async function endBrowserLabelSession(){stopBrowserLabelPlay(); if(!labelSessionId){showLabelStudio(false);return} try{await api('/api/label-session/end',{session_id:labelSessionId})}catch(e){} labelSessionId='';labelSessionState=null;labelActiveObjectId=null;labelHiddenObjectIds.clear();sessionStorage.removeItem('labelSessionId');showLabelStudio(false);loadLabelResults()}
 async function runLabelCurrent(){await startBrowserLabelSession()}
 async function copyCommand(action){try{const cmd=await command(action); await navigator.clipboard.writeText(cmd); toast('命令已复制')}catch(e){toast(e.message)}}
-async function runAction(action){try{const vmPassword=(action==='convert'||action==='vm_ssh')?(document.getElementById('vm_password')?.value||''):''; const keyInput=document.getElementById('vm_private_key'); const vmPrivateKey=(action==='convert'||action==='vm_ssh')&&keyInput?.files?.[0]?await keyInput.files[0].text():''; await api('/api/run',{action,values:collect(),vm_password:vmPassword,vm_private_key:vmPrivateKey}); if(action==='convert'||action==='vm_ssh'){const password=document.getElementById('vm_password'); if(password) password.value=''; if(keyInput) keyInput.value=''} showTab('logs'); toast('任务已启动'); refreshState()}catch(e){toast(e.message)}}
+async function runAction(action){try{await api('/api/run',{action,values:collect()}); showTab('logs'); toast('任务已启动'); refreshState()}catch(e){toast(e.message)}}
 function updateJobInputMode(){const input=document.getElementById('job-input'); const secret=document.getElementById('job-input-secret'); if(input&&secret) input.type=secret.checked?'password':'text'}
-async function sendJobInput(){const input=document.getElementById('job-input'); const secret=document.getElementById('job-input-secret'); const text=(input?.value||'').replace(/[\r\n]/g,''); if(!text){toast('请输入要发送的内容');return} try{await api('/api/input',{text,secret:!!secret?.checked}); input.value=''; toast(secret?.checked?'密码已发送':'输入已发送'); refreshState()}catch(e){toast(e.message)}}
 async function stopJob(){try{const j=await api('/api/stop',{}); toast(j.stopped?'已请求停止':'当前没有正在运行的任务'); refreshState()}catch(e){toast(e.message)}}
-async function stopTrainExport(){try{const j=await api('/api/stop-train-export',{}); toast(j.stopped?'已请求停止训练并导出当前 best':'当前没有正在训练的任务'); showTab('logs'); refreshState()}catch(e){toast(e.message)}}
 function openImageLightbox(src,title){const box=document.getElementById('image-lightbox'); const image=document.getElementById('image-lightbox-image'); const caption=document.getElementById('image-lightbox-title'); if(!box||!image||!caption) return; image.src=src; image.alt=title; caption.textContent=title; box.hidden=false; document.body.style.overflow='hidden'; document.getElementById('image-lightbox-close')?.focus()}
 function closeImageLightbox(){const box=document.getElementById('image-lightbox'); if(!box||box.hidden) return; box.hidden=true; document.body.style.overflow=''}
 async function loadLabelResults(){try{await saveValues(); const r=await fetch('/api/label-results'); const j=await r.json(); const box=document.getElementById('label-results'); box.innerHTML=''; const items=j.items||[]; if(!items.length){box.innerHTML='<div class="empty">当前图片目录和标注目录中还没有可显示的标注结果。</div>'; return} for(const it of items){const card=document.createElement('div'); card.className='sample'; const src='/api/label-preview?image='+encodeURIComponent(it.image)+'&xml='+encodeURIComponent(it.xml)+'&t='+Date.now(); const title=`${it.stem} · ${(it.boxes||[]).length} 个框`; card.innerHTML=`<button class="preview-trigger" type="button" aria-label="放大查看 ${title}"><img src="${src}" loading="lazy" alt="${title}"></button><div class="meta"><b>${it.stem}</b><span>${(it.boxes||[]).length} 个框</span><button class="delete">删除标注</button></div>`; card.querySelector('.preview-trigger').onclick=()=>openImageLightbox(src,title); card.querySelector('.delete').onclick=async()=>{const imageMode=collect().label_source_type==='images'; const target=imageMode?'对应 XML 标注':'这张图片和对应 XML'; if(Date.now()>deleteConfirmUntil){if(!confirm(`确定删除${target}吗？\n确认后 5 分钟内删除标注不再重复询问。`)) return; deleteConfirmUntil=Date.now()+5*60*1000} await api('/api/delete-label-sample',{image:it.image,xml:it.xml}); card.remove(); toast(imageMode?'已删除 XML 标注':'已删除废图和 XML')}; box.appendChild(card)}}catch(e){toast(e.message)}}
@@ -2316,7 +2076,7 @@ refreshState(); setInterval(refreshState,1400);
 
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "MaixCamWebPanel/1.0"
+    server_version = "YOLOWebPanel/1.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -2516,20 +2276,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                     STATE["values"] = values.copy()
                 self.send_json({"ok": True, "values": values, "path": str(USER_DEFAULTS_FILE)})
                 return
-            if self.path == "/api/pick-convert-output-dir":
-                values = clean_values(body.get("values"))
-                selected = pick_directory(
-                    values.get("convert_output_dir") or values.get("dataset_root", ""),
-                    "选择标准训练输出文件夹",
-                )
-                if selected:
-                    values.update(detect_convert_output_files(selected))
-                    with STATE_LOCK:
-                        STATE["values"] = values.copy()
-                    self.send_json({"values": values})
-                else:
-                    self.send_json({"values": None})
-                return
             if self.path == "/api/pick-test-image":
                 values = clean_values(body.get("values"))
                 self.send_json({"path": pick_image_file(values.get("test_image_file", ""))})
@@ -2647,20 +2393,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             if self.path == "/api/run":
                 action = str(body.get("action", ""))
                 values = clean_values(body.get("values"))
-                vm_password = str(body.get("vm_password", ""))
-                vm_private_key = str(body.get("vm_private_key", ""))
-                start_job(action, values, vm_password=vm_password, vm_private_key=vm_private_key)
-                self.send_json({"ok": True})
-                return
-            if self.path == "/api/input":
-                send_job_input(str(body.get("text", "")), bool(body.get("secret", False)))
+                start_job(action, values)
                 self.send_json({"ok": True})
                 return
             if self.path == "/api/stop":
                 self.send_json({"stopped": stop_job()})
-                return
-            if self.path == "/api/stop-train-export":
-                self.send_json({"stopped": stop_train_and_export()})
                 return
 
             if self.path == "/api/delete-label-sample":

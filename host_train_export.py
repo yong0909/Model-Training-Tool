@@ -5,13 +5,10 @@ import datetime as dt
 import os
 import random
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -71,22 +68,6 @@ def run(cmd, cwd=None, check=True, env=None, timeout=None):
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, argv)
     return result
-
-
-def prepare_ssh_askpass(password: str):
-    """Create a temporary Linux SSH_ASKPASS helper for password authentication."""
-    if not password:
-        return None, None
-    directory = Path(tempfile.mkdtemp(prefix="maixcam_ssh_"))
-    script = directory / "askpass.sh"
-    script.write_text("#!/bin/sh\nprintf '%s\\n' \"$MAIXCAM_VM_SSH_PASSWORD\"\n", encoding="ascii")
-    script.chmod(0o700)
-    env = subprocess_env()
-    env["MAIXCAM_VM_SSH_PASSWORD"] = password
-    env["SSH_ASKPASS"] = str(script)
-    env["SSH_ASKPASS_REQUIRE"] = "force"
-    env.setdefault("DISPLAY", "maixcam-askpass:0")
-    return directory, env
 
 
 def interrupt_process_tree(proc: subprocess.Popen, timeout: float = 8.0) -> None:
@@ -181,25 +162,6 @@ def parse_train_ratio_percent(value):
     if not 1 <= ratio <= 100:
         raise SystemExit("--train-ratio-percent 必须在 1 到 100 之间")
     return ratio
-
-
-def validate_mud_metadata(args):
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.model_name):
-        raise SystemExit("--model-name 仅支持字母、数字、下划线、连字符和点")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.mud_model_type):
-        raise SystemExit("--mud-model-type 仅支持字母、数字、下划线、连字符和点")
-    args.mud_model_type = args.mud_model_type.lower()
-
-    anchors = args.mud_anchors.strip()
-    if anchors and not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", anchors):
-        raise SystemExit("--mud-anchors 必须是以英文逗号分隔的非负整数")
-    if args.stage in {"convert", "all"} and args.mud_model_type.lower() == "yolov5":
-        if not anchors:
-            raise SystemExit("--mud-anchors 是 YOLOv5 MUD 的必填项；请填写训练/导出配置中的实际 anchors")
-        if len(anchors.split(",")) % 2:
-            raise SystemExit("--mud-anchors 必须包含成对的宽、高整数")
-
-    args.mud_anchors = ", ".join(str(int(item.strip())) for item in anchors.split(",")) if anchors else ""
 
 
 def validate_image_dimensions(args):
@@ -444,7 +406,6 @@ param(
     [Parameter(Mandatory=$true)][double]$Lr0,
     [ValidateSet("detect", "classify")][string]$TrainTask = "detect",
     [string]$CondaEnv = "yolov8",
-    [ValidateSet("recommended", "maixcam")][string]$OperatorMode = "recommended",
     [string]$TorchCuda = "cu128",
     [ValidateSet("cuda", "cpu")][string]$TrainDevice = "cuda",
     [ValidateSet("False", "True", "disk")][string]$TrainCache = "False"
@@ -533,8 +494,7 @@ if ($TrainExitCode -ne 0) { throw "YOLO train failed with exit code $TrainExitCo
 $BestPt = Join-Path $JobDir "$ProjectName\weights\best.pt"
 if (!(Test-Path $BestPt)) { throw "best.pt not found: $BestPt" }
 
-$ExportOpset = if ($OperatorMode -eq "maixcam") { 11 } else { 17 }
-Invoke-Argv $YoloCmd @("export", "model=$BestPt", "format=onnx", "imgsz=$ImgSize", "simplify=True", "opset=$ExportOpset", "dynamic=False")
+Invoke-Argv $YoloCmd @("export", "model=$BestPt", "format=onnx", "imgsz=$ImgSize", "simplify=True", "opset=17", "dynamic=False")
 $BestOnnx = Join-Path $JobDir "$ProjectName\weights\best.onnx"
 if (!(Test-Path $BestOnnx)) { throw "best.onnx not found: $BestOnnx" }
 
@@ -584,7 +544,6 @@ def train_remote_windows(args, yolo_data: Path, work: Path, timestamp: str):
         f"-Lr0 {args.lr0} "
         f"-TrainTask {ps_single_quote(args.train_task)} "
         f"-CondaEnv {ps_single_quote(args.conda_env)} "
-        f"-OperatorMode {ps_single_quote(args.operator_mode)} "
         f"-TorchCuda {ps_single_quote(args.torch_cuda)} "
         f"-TrainDevice {ps_single_quote(args.train_device)} "
         f"-TrainCache {ps_single_quote(args.train_cache)}"
@@ -666,9 +625,8 @@ def train_local(args, dataset_path: Path, work: Path):
     if not best_pt.exists():
         raise SystemExit(f"best.pt not found: {best_pt}")
 
-    export_opset = 11 if args.operator_mode == "maixcam" else 17
     export_size = imgsz_arg(args) if args.train_task == "detect" else max(args.img_width, args.img_height)
-    run(yolo_cmd + ["export", f"model={best_pt}", "format=onnx", f"imgsz={export_size}", "simplify=True", f"opset={export_opset}", "dynamic=False"])
+    run(yolo_cmd + ["export", f"model={best_pt}", "format=onnx", f"imgsz={export_size}", "simplify=True", "opset=17", "dynamic=False"])
     best_onnx = best_pt.with_suffix(".onnx")
     if not best_onnx.exists():
         raise SystemExit(f"best.onnx not found: {best_onnx}")
@@ -676,10 +634,10 @@ def train_local(args, dataset_path: Path, work: Path):
 
 
 
-def run_train_stage(args, script_root: Path):
+def run_train_stage(args):
     dataset_root = Path(args.dataset_root).resolve()
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    work = dataset_root / f".maixcam_work_{timestamp}"
+    work = dataset_root / f".train_work_{timestamp}"
     yolo_data = work / "yolo_dataset"
     out = dataset_root / f"outputs_{timestamp}"
     work.mkdir(parents=True, exist_ok=True)
@@ -693,10 +651,6 @@ def run_train_stage(args, script_root: Path):
             yolo_data,
             train_ratio_percent=args.train_ratio_percent,
         )
-        train_images = sorted(
-            path for path in (yolo_data / "train").rglob("*")
-            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-        )
     else:
         annotations_dir = Path(args.annotations_dir).resolve() if args.annotations_dir else dataset_root / "annotations"
         dataset_path, _ = prepare_voc_yolo(
@@ -708,7 +662,6 @@ def run_train_stage(args, script_root: Path):
             img_height=args.img_height,
             resize_mode=args.image_resize_mode,
         )
-        train_images = sorted((yolo_data / "images" / "train").glob("*.jpg"))
 
     best_pt, best_onnx = train_local(args, dataset_path, work)
 
@@ -727,242 +680,24 @@ def run_train_stage(args, script_root: Path):
             if artifact.is_file():
                 shutil.copy2(artifact, plot_dir / artifact.name)
 
-    calib_dir = out / "calib_images"
-    calib_dir.mkdir(parents=True, exist_ok=True)
-    train_images = train_images[:200]
-    if not train_images:
-        raise SystemExit("No calibration image copied")
-    for img in train_images:
-        target_name = f"{img.parent.name}_{img.name}" if args.train_task == "classify" else img.name
-        shutil.copy2(img, calib_dir / target_name)
-    test_image = out / "test.jpg"
-    shutil.copy2(train_images[0], test_image)
-
-    vm_script = script_root / "vm_convert_pack.sh"
-    if vm_script.exists():
-        shutil.copy2(vm_script, out / "vm_convert_pack.sh")
-
     print(f"TRAIN_OUTPUT_DIR={out}", flush=True)
     print(f"TRAIN_PLOT_DIR={plot_dir}", flush=True)
     print(f"TRAIN_MODEL_PT={out_pt}", flush=True)
     print(f"TRAIN_MODEL_ONNX={out_onnx}", flush=True)
     print(f"TRAIN_CLASSES={out / 'classes.txt'}", flush=True)
-    print(f"TRAIN_CALIB_DIR={calib_dir}", flush=True)
-    print(f"TRAIN_TEST_IMAGE={test_image}", flush=True)
     return {
         "timestamp": timestamp,
         "out": out,
         "model_pt": out_pt,
         "model_onnx": out_onnx,
         "classes": out / "classes.txt",
-        "calib_dir": calib_dir,
-        "test_image": test_image,
         "model_name": model_name,
     }
 
 
-def first_image(directory: Path):
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-        items = sorted(directory.glob(ext))
-        if items:
-            return items[0]
-    return None
-
-
-def resolve_convert_inputs(args):
-    model_path = Path(args.model_path).resolve() if args.model_path else None
-    if not model_path or not model_path.exists():
-        raise SystemExit("--model-path is required for convert stage and must exist")
-
-    base_dir = model_path.parent
-    classes_path = Path(args.classes_path).resolve() if args.classes_path else base_dir / "classes.txt"
-    calib_dir = Path(args.calib_dir).resolve() if args.calib_dir else base_dir / "calib_images"
-    test_image = Path(args.test_image).resolve() if args.test_image else base_dir / "test.jpg"
-
-    if not classes_path.exists():
-        raise SystemExit(f"classes.txt not found: {classes_path}")
-    if not calib_dir.is_dir():
-        raise SystemExit(f"calib_images folder not found: {calib_dir}")
-    if not test_image.exists():
-        fallback = first_image(calib_dir)
-        if not fallback:
-            raise SystemExit(f"test image not found and no calibration image available: {test_image}")
-        test_image = fallback
-    return model_path, classes_path, calib_dir, test_image
-
-
-def extract_convert_archive(archive_path: Path, destination: Path) -> Path:
-    """Safely extract a conversion archive and return its single top-level directory."""
-    if not archive_path.is_file() or archive_path.stat().st_size == 0:
-        raise SystemExit(f"downloaded conversion archive is missing or empty: {archive_path}")
-
-    destination.mkdir(parents=True, exist_ok=True)
-    destination_root = destination.resolve()
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
-        top_level_dirs = {
-            Path(member.name).parts[0]
-            for member in members
-            if member.name and not Path(member.name).is_absolute() and Path(member.name).parts
-        }
-        if len(top_level_dirs) != 1:
-            raise SystemExit(f"conversion archive must contain exactly one top-level directory: {archive_path}")
-        for member in members:
-            member_path = (destination_root / member.name).resolve()
-            if not member.name or member_path == destination_root or destination_root not in member_path.parents:
-                raise SystemExit(f"unsafe path in conversion archive: {member.name!r}")
-        archive.extractall(destination_root, members=members)
-
-    extracted_dir = destination_root / top_level_dirs.pop()
-    if not extracted_dir.is_dir():
-        raise SystemExit(f"conversion archive did not produce an output directory: {extracted_dir}")
-    return extracted_dir
-
-
-def run_convert_stage(args, script_root: Path, train_result=None):
-    if args.train_task == "classify":
-        raise SystemExit("MaixCAM 转换流程目前仅支持目标检测 ONNX；分类模型可直接使用导出的 .pt 或 .onnx。")
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dataset_root = Path(args.dataset_root).resolve()
-
-    if train_result:
-        model_path = train_result["model_onnx"]
-        classes_path = train_result["classes"]
-        calib_dir = train_result["calib_dir"]
-        test_image = train_result["test_image"]
-        model_name = train_result["model_name"]
-    else:
-        model_path, classes_path, calib_dir, test_image = resolve_convert_inputs(args)
-        model_name = args.model_name or model_path.stem
-
-    remote_model_dir = "".join(char if char.isalnum() or char in "._-" else "_" for char in model_name).strip("._") or "model"
-    remote_work_dir = f"{args.vm_work_dir.rstrip('/')}/{remote_model_dir}"
-    # 远端 shell 中不能将 `~` 用单引号包裹，否则不会展开为用户主目录。
-    if remote_work_dir == "~":
-        remote_shell_work_dir = "$HOME"
-    elif remote_work_dir.startswith("~/"):
-        remote_shell_work_dir = "$HOME/" + shlex.quote(remote_work_dir[2:])
-    else:
-        remote_shell_work_dir = shlex.quote(remote_work_dir)
-
-    out = dataset_root / f"convert_outputs_{timestamp}"
-    out.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(model_path, out / f"{model_name}.onnx")
-    shutil.copy2(classes_path, out / "classes.txt")
-    shutil.copy2(test_image, out / "test.jpg")
-    local_calib = out / "calib_images"
-    if local_calib.exists():
-        shutil.rmtree(local_calib)
-    shutil.copytree(calib_dir, local_calib)
-
-    vm_script = script_root / "vm_convert_pack.sh"
-    if not vm_script.exists():
-        raise SystemExit(f"vm_convert_pack.sh not found: {vm_script}")
-    packaged_vm_script = out / "vm_convert_pack.sh"
-    shutil.copy2(vm_script, packaged_vm_script)
-    print(f"CONVERT_SCRIPT_SOURCE={vm_script}", flush=True)
-    print(f"CONVERT_SCRIPT_PACKAGE={packaged_vm_script}", flush=True)
-
-    zip_path = dataset_root / f"maixcam_convert_job_{timestamp}.zip"
-    # 即使极短时间内时间戳重复，也不复用旧 ZIP，确保其中始终是当前根目录脚本的副本。
-    if zip_path.exists():
-        zip_path.unlink()
-    zip_dir_contents(out, zip_path)
-    if not zip_path.is_file() or zip_path.stat().st_size == 0:
-        raise SystemExit(f"failed to create conversion package: {zip_path}")
-    print(f"CONVERT_PACKAGE_REBUILT={zip_path}", flush=True)
-    remote = f"{args.vm_user}@{args.vm_host}"
-    print(f"CONVERT_INPUT_MODEL={model_path}", flush=True)
-    print(f"CONVERT_WORK_DIR={out}", flush=True)
-    print(f"CONVERT_VM_WORK_DIR={remote_work_dir}", flush=True)
-    print(f"CONVERT_PACKAGE={zip_path}", flush=True)
-    askpass_dir, ssh_env = prepare_ssh_askpass(os.environ.get("MAIXCAM_VM_SSH_PASSWORD", ""))
-    private_key_path = Path(args.vm_private_key).resolve() if args.vm_private_key else None
-    if private_key_path and not private_key_path.is_file():
-        raise SystemExit(f"SSH 私钥文件不存在: {private_key_path}")
-    if not ssh_env and not private_key_path:
-        raise SystemExit("请输入密码或导入私钥")
-    ssh_options = [
-        "-vv",
-        "-o", "ConnectTimeout=20",
-        "-o", "ConnectionAttempts=1",
-        "-o", "ServerAliveInterval=10",
-        "-o", "ServerAliveCountMax=3",
-    ]
-    if ssh_env:
-        # 密码登录时不尝试本机加密私钥，避免无终端环境读取私钥口令而阻塞。
-        ssh_options.extend([
-            "-o", "BatchMode=no",
-            "-o", "PubkeyAuthentication=no",
-            "-o", "PreferredAuthentications=password,keyboard-interactive",
-        ])
-    else:
-        ssh_options.extend([
-            "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes",
-            "-i", str(private_key_path),
-            "-o", "PreferredAuthentications=publickey",
-        ])
-    try:
-        print(
-            "SSH_DIAGNOSTICS "
-            f"host={args.vm_host} user={args.vm_user} auth={'password' if ssh_env else 'private_key'}",
-            flush=True,
-        )
-        print(f"Creating VM work directory: {remote_work_dir}", flush=True)
-        run(
-            ["ssh", *ssh_options, remote, f"mkdir -p {remote_shell_work_dir}"],
-            env=ssh_env,
-            timeout=55,
-        )
-        print(f"Uploading package: {zip_path.name}", flush=True)
-        run(["scp", *ssh_options, str(zip_path), f"{remote}:{remote_work_dir}/"], env=ssh_env, timeout=900)
-
-        zip_name = zip_path.name
-        remote_job = f"job_{timestamp}"
-        remote_outputs = f"outputs_{timestamp}"
-        env_prefix = (
-            f"TS={shlex.quote(timestamp)} "
-            f"MUD_MODEL_TYPE={shlex.quote(args.mud_model_type)} "
-            f"MUD_ANCHORS={shlex.quote(args.mud_anchors)} "
-        )
-        remote_cmd = (
-            f"cd {remote_shell_work_dir} && rm -rf {shlex.quote(remote_job)} "
-            f"{shlex.quote(remote_outputs)} {shlex.quote(f'{remote_outputs}.tar.gz')} "
-            f"&& unzip -o {shlex.quote(zip_name)} -d {shlex.quote(remote_job)} "
-            f"&& cd {shlex.quote(remote_job)} && {env_prefix}bash vm_convert_pack.sh "
-            f"&& mv {shlex.quote(f'{remote_outputs}.tar.gz')} {shlex.quote(f'../{remote_outputs}.tar.gz')}"
-        )
-
-        if args.skip_vm_convert:
-            print("VM next command:")
-            print(remote_cmd)
-            return None
-
-        print("Running VM conversion...", flush=True)
-        run(["ssh", *ssh_options, remote, remote_cmd], env=ssh_env)
-        print("Downloading final outputs from VM...", flush=True)
-        final_tar = dataset_root / f"{remote_outputs}.tar.gz"
-        run(["scp", *ssh_options, f"{remote}:{remote_work_dir}/{remote_outputs}.tar.gz", str(dataset_root)], env=ssh_env, timeout=900)
-        final_dir = dataset_root / remote_outputs
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        print(f"Extracting final outputs to: {final_dir}", flush=True)
-        extracted_dir = extract_convert_archive(final_tar, dataset_root)
-        if extracted_dir != final_dir:
-            raise SystemExit(f"unexpected conversion output directory: {extracted_dir}")
-        print(f"CONVERT_FINAL_TAR={final_tar}", flush=True)
-        print(f"CONVERT_FINAL_DIR={final_dir}", flush=True)
-        print(f"Final package downloaded and extracted: {final_dir}")
-        return final_tar
-    finally:
-        if askpass_dir:
-            shutil.rmtree(askpass_dir, ignore_errors=True)
-
-
 def build_parser(script_root: Path):
-    ap = argparse.ArgumentParser(description="YOLO train / MaixCAM model convert workflow")
-    ap.add_argument("--stage", choices=["train", "convert", "all"], default="all")
+    ap = argparse.ArgumentParser(description="YOLO training and ONNX export workflow")
+    ap.add_argument("--stage", choices=["train"], default="train")
     ap.add_argument("--dataset-root", default=str(script_root))
     ap.add_argument("--images-dir", default="")
     ap.add_argument("--train-task", choices=["detect", "classify"], default="detect", help="训练任务：检测或图像分类")
@@ -986,34 +721,14 @@ def build_parser(script_root: Path):
     ap.add_argument("--project-name", default="douzi_yolov8n_448")
 
     ap.add_argument("--model-name", default="douzi_yolov8n_448")
-    ap.add_argument("--operator-mode", choices=["recommended", "maixcam"], default="recommended")
-
-    ap.add_argument("--model-path", default="")
-    ap.add_argument("--classes-path", default="")
-    ap.add_argument("--calib-dir", default="")
-    ap.add_argument("--test-image", default="")
-    ap.add_argument("--mud-model-type", default="yolov8")
-    ap.add_argument("--mud-anchors", default="", help="YOLOv5 MUD 必填；以逗号分隔的宽、高 anchors")
-
-    ap.add_argument("--vm-user", default="")
-    ap.add_argument("--vm-host", default="")
-    ap.add_argument("--vm-work-dir", default="~/maixcam_jobs")
-    ap.add_argument("--vm-private-key", default="", help="仅当前转换任务使用的 SSH 私钥文件")
-    ap.add_argument("--skip-vm-convert", action="store_true")
     return ap
 
 
 def main():
     script_root = Path(__file__).resolve().parent
     args = build_parser(script_root).parse_args()
-    validate_mud_metadata(args)
     validate_image_dimensions(args)
-
-    train_result = None
-    if args.stage in ("train", "all"):
-        train_result = run_train_stage(args, script_root)
-    if args.stage in ("convert", "all"):
-        run_convert_stage(args, script_root, train_result=train_result if args.stage == "all" else None)
+    run_train_stage(args)
 
 
 if __name__ == "__main__":
