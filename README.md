@@ -7,8 +7,10 @@
 - 浏览器面板：训练、推理、日志和进度展示。
 - 视频、摄像头或图片集跟踪标注，输出 VOC XML。
 - 目标检测和图像分类训练。
+- 目标检测数据可按视频源分组划分，避免相邻帧同时进入训练集和验证集。
 - 训练完成后导出标准 ONNX 与 `.pt` 模型。
 - 使用 `.pt` 模型进行摄像头、单图或图片目录推理。
+- 检查 Ultralytics YOLO 检测 ONNX，转换 RK3588/RK3588S FP 或 INT8 RKNN，并生成板端示例包。
 
 ## 环境
 
@@ -46,6 +48,7 @@ cp train_panel_defaults.example.json train_panel_defaults.json
   "dataset_root": "/home/user/datasets/helmet",
   "train_images_dir": "/home/user/datasets/helmet/images",
   "train_annotations_dir": "/home/user/datasets/helmet/annotations",
+  "split_mode": "video_group",
   "train_task": "detect",
   "train_device": "cuda",
   "base_model": "yolov8n.pt",
@@ -54,6 +57,14 @@ cp train_panel_defaults.example.json train_panel_defaults.json
   "label_annotations_dir": "/home/user/datasets/helmet/annotations"
 }
 ```
+
+目标检测默认使用 `video_group` 划分：网页标注产生的图片名形如
+`视频前缀_000015.jpg`，工具会移除末尾帧号作为视频源标识，并将同一视频的
+全部帧放入同一个集合。训练/验证比例会在整段视频的粒度上尽量接近设定值，
+同时兼顾各类别数量；因此实际图片比例可能不是严格的 80%/20%。只有图片之间
+本来就相互独立时，才选择 `random` 逐图片随机划分。每次整理后的 YOLO 数据集
+还会生成 `split_manifest.csv`，记录每张图片的集合和视频源，可用于检查两边是否
+存在同源视频。
 
 网页中的“存为默认”也会更新该文件。训练任务使用 `detect` 或 `classify`；分类任务要求图片按类别放在子目录中。
 
@@ -70,6 +81,37 @@ python train_panel.py --host 127.0.0.1 --port 8989
 - [`host_train_export.py`](host_train_export.py)：数据集准备、训练和 ONNX 导出。
 - [`video_track_label.py`](video_track_label.py)：视频、摄像头和图片集标注。
 - [`model_test.py`](model_test.py)：模型推理测试。
+- [`rk3588_deploy.py`](rk3588_deploy.py)：RKNN 环境/ONNX 检查、模型转换和部署包生成。
+
+## RK3588 转换与打包
+
+网页中的“RK3588 转换”页签在独立 Python 环境中调用 RKNN-Toolkit2。项目不会自动安装
+`rknn-toolkit2`，也不会把它加入根目录 `requirements.txt`：请从板卡厂商 SDK 获取与板端
+RKNN Runtime/RKNPU 驱动匹配的 wheel，并把该虚拟环境的 Python 路径填入网页。转换功能不保存
+SSH 信息，也不自动上传开发板。
+
+命令行示例：
+
+```bash
+/home/user/rknn-env/bin/python rk3588_deploy.py \
+  --onnx /path/model.onnx \
+  --classes /path/classes.txt \
+  --output-dir /path/rk3588_deploy \
+  --mode both \
+  --calibration-dir /path/calibration_images \
+  --calibration-count 200 \
+  --test-image /path/test.jpg \
+  --conf 0.25 \
+  --iou 0.45
+```
+
+`--mode` 支持 `fp`、`int8` 和 `both`。INT8 至少需要 20 张校准图片，建议使用 100 张以上
+有代表性的真实图片。若 Toolkit 提示 opset 或算子不支持，可从原 `.pt` 重新导出静态
+`opset=12` ONNX，无需重新训练。
+
+生成的 ZIP 包含 RKNN 模型、类别、转换清单、校准列表和可在开发板运行的
+`infer_image.py`。包内不包含 Lite2 wheel、`librknnrt.so` 或驱动文件，这些文件必须来自
+板卡厂商配套 SDK。在真实 RK3588/RK3588S 上验证前，此功能仅表示转换与打包完成。
 
 ## 常用命令
 
@@ -77,6 +119,7 @@ python train_panel.py --host 127.0.0.1 --port 8989
 python host_train_export.py --help
 python video_track_label.py --help
 python model_test.py --help
+python rk3588_deploy.py --help
 ```
 
 直接标注视频的示例：
@@ -94,7 +137,7 @@ python video_track_label.py \
 提交前运行：
 
 ```bash
-python -m py_compile train_panel.py host_train_export.py model_test.py video_track_label.py
+python -m py_compile train_panel.py host_train_export.py model_test.py video_track_label.py rk3588_deploy.py
 python train_panel.py --help
 python host_train_export.py --help
 python model_test.py --help

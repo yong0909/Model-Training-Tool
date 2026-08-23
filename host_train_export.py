@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import os
 import random
@@ -13,6 +14,7 @@ import time
 import xml.etree.ElementTree as ET
 
 import zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from PIL import Image
@@ -164,6 +166,110 @@ def parse_train_ratio_percent(value):
     return ratio
 
 
+VIDEO_FRAME_STEM_RE = re.compile(r"^(?P<source>.+)_(?P<frame>\d{6,})$")
+
+
+def detection_source_group(image_path: Path) -> str:
+    """Return the source video prefix used by the labeling workflow."""
+    match = VIDEO_FRAME_STEM_RE.fullmatch(image_path.stem)
+    return match.group("source") if match else image_path.stem
+
+
+def split_detection_records(records, val_ratio, seed=42, split_mode="video_group"):
+    """Split detection records, keeping frames from one video in one split."""
+    target_val_count = max(1, min(int(round(len(records) * val_ratio)), len(records) - 1))
+    if split_mode == "random":
+        shuffled = list(records)
+        random.Random(seed).shuffle(shuffled)
+        print("split_mode=random warning=同一视频的相邻帧可能同时进入训练集和验证集")
+        return {"val": shuffled[:target_val_count], "train": shuffled[target_val_count:]}
+    if split_mode != "video_group":
+        raise SystemExit("--split-mode 必须是 video_group 或 random")
+
+    groups = defaultdict(list)
+    for record in records:
+        groups[detection_source_group(record[0])].append(record)
+    if len(groups) < 2:
+        raise SystemExit("按视频源划分至少需要 2 个不同的视频前缀；文件名应类似 视频名_000015.jpg")
+
+    group_class_counts = {}
+    total_class_counts = Counter()
+    class_group_counts = Counter()
+    for group_name, items in groups.items():
+        counts = Counter(name for item in items for name, *_ in item[2])
+        group_class_counts[group_name] = counts
+        total_class_counts.update(counts)
+        class_group_counts.update(counts.keys())
+
+    group_names = sorted(groups)
+    randomizer = random.Random(seed)
+    attempts = max(256, min(8192, 400000 // len(group_names)))
+    best_candidate = None
+    for _ in range(attempts):
+        order = group_names.copy()
+        randomizer.shuffle(order)
+        selected = []
+        val_count = 0
+        val_class_counts = Counter()
+        for group_name in order[:-1]:
+            selected.append(group_name)
+            val_count += len(groups[group_name])
+            val_class_counts.update(group_class_counts[group_name])
+
+            coverage_penalty = 0
+            for class_name, total in total_class_counts.items():
+                val_class_count = val_class_counts[class_name]
+                if class_group_counts[class_name] >= 2:
+                    coverage_penalty += int(val_class_count == 0 or val_class_count == total)
+                else:
+                    coverage_penalty += int(val_class_count > 0)
+            frame_ratio_error = abs(val_count / len(records) - val_ratio)
+            class_ratio_error = sum(
+                abs(val_class_counts[name] / total - val_ratio)
+                for name, total in total_class_counts.items()
+            ) / max(1, len(total_class_counts))
+            group_ratio_error = abs(len(selected) / len(group_names) - val_ratio)
+            score = (
+                coverage_penalty,
+                frame_ratio_error + 0.35 * class_ratio_error,
+                frame_ratio_error,
+                class_ratio_error,
+                group_ratio_error,
+            )
+            candidate = (score, tuple(sorted(selected)))
+            if best_candidate is None or candidate < best_candidate:
+                best_candidate = candidate
+
+    val_groups = set(best_candidate[1])
+    splits = {
+        "val": [record for name in group_names if name in val_groups for record in groups[name]],
+        "train": [record for name in group_names if name not in val_groups for record in groups[name]],
+    }
+    train_groups = set(group_names) - val_groups
+    shared_groups = train_groups & val_groups
+    if shared_groups:
+        raise RuntimeError(f"训练集和验证集出现同源视频: {sorted(shared_groups)}")
+
+    grouped_images = sum(len(items) for items in groups.values() if len(items) > 1)
+    print(
+        f"split_mode=video_group source_groups={len(groups)} "
+        f"train_groups={len(train_groups)} val_groups={len(val_groups)} shared_groups=0"
+    )
+    print(
+        f"split_target_val={target_val_count} split_actual_val={len(splits['val'])} "
+        f"grouped_images={grouped_images}"
+    )
+    if not grouped_images:
+        print("split_warning=未识别到视频帧序列，当前每张图片被视为独立来源")
+    single_source_classes = sorted(name for name, count in class_group_counts.items() if count == 1)
+    if single_source_classes:
+        print(
+            "split_warning=以下类别只来自一个视频源，只能保留在训练集，无法独立验证: "
+            + ", ".join(single_source_classes)
+        )
+    return splits
+
+
 def validate_image_dimensions(args):
     legacy_size = args.img_size
     if args.img_width is None:
@@ -235,7 +341,7 @@ def transform_image_and_boxes(image_path: Path, boxes, source_size, target_size,
     return image, [box for box in (clip_box(box, target_width, target_height) for box in transformed) if box]
 
 
-def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_ratio_percent=80, seed=42, img_width=448, img_height=448, resize_mode="letterbox"):
+def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_ratio_percent=80, seed=42, img_width=448, img_height=448, resize_mode="letterbox", split_mode="video_group"):
     train_ratio_percent = parse_train_ratio_percent(train_ratio_percent)
     val_ratio = max(0.0, min(0.99, (100.0 - train_ratio_percent) / 100.0))
     img_dir = images_dir.resolve()
@@ -278,11 +384,7 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
     if len(records) < 2:
         raise SystemExit("至少需要 2 张有效标注图片，才能划分训练集和验证集")
 
-    random.seed(seed)
-    random.shuffle(records)
-    val_n = int(round(len(records) * val_ratio))
-    val_n = max(1, min(val_n, len(records) - 1))
-    splits = {"val": records[:val_n], "train": records[val_n:]}
+    splits = split_detection_records(records, val_ratio, seed=seed, split_mode=split_mode)
     class_ids = {name: index for index, name in enumerate(classes)}
 
     output_counts = {}
@@ -318,9 +420,17 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
         encoding="utf-8",
     )
     (out / "classes.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+    split_manifest = out / "split_manifest.csv"
+    with split_manifest.open("w", encoding="utf-8", newline="") as manifest_file:
+        writer = csv.writer(manifest_file)
+        writer.writerow(["split", "source_group", "image"])
+        for split, items in splits.items():
+            for image_path, _, _ in items:
+                writer.writerow([split, detection_source_group(image_path), image_path.name])
     print(f"classes={classes}")
     print(f"image_resize_mode={resize_mode} target_size={img_width}x{img_height}")
     print(f"train={len(splits['train'])} val={len(splits['val'])}")
+    print(f"split_manifest={split_manifest}")
     return dataset_yaml, classes
 
 
@@ -661,6 +771,7 @@ def run_train_stage(args):
             img_width=args.img_width,
             img_height=args.img_height,
             resize_mode=args.image_resize_mode,
+            split_mode=args.split_mode,
         )
 
     best_pt, best_onnx = train_local(args, dataset_path, work)
@@ -703,6 +814,12 @@ def build_parser(script_root: Path):
     ap.add_argument("--train-task", choices=["detect", "classify"], default="detect", help="训练任务：检测或图像分类")
     ap.add_argument("--annotations-dir", default="")
     ap.add_argument("--train-ratio-percent", type=float, default=80.0, help="训练集占比，1 到 100；验证集占比自动为 100 减该值")
+    ap.add_argument(
+        "--split-mode",
+        choices=["video_group", "random"],
+        default="video_group",
+        help="检测数据划分方式：按视频前缀分组（推荐）或逐图片随机",
+    )
 
 
     ap.add_argument("--img-size", type=int, default=None, help="兼容旧调用：同时设置图片宽度和高度")

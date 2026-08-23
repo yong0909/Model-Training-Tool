@@ -4,6 +4,7 @@ import json
 import locale
 import mimetypes
 import os
+import platform
 import re
 import shlex
 import signal
@@ -53,6 +54,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 WORKFLOW_SCRIPT = SCRIPT_ROOT / "host_train_export.py"
 TEST_SCRIPT = SCRIPT_ROOT / "model_test.py"
 LABEL_SCRIPT = SCRIPT_ROOT / "video_track_label.py"
+RKNN_DEPLOY_SCRIPT = SCRIPT_ROOT / "rk3588_deploy.py"
 USER_DEFAULTS_FILE = SCRIPT_ROOT / "train_panel_defaults.json"
 STOP_EXPORT_SIGNAL_FILE = SCRIPT_ROOT / ".train_stop_export.signal"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg"}
@@ -70,6 +72,7 @@ DEFAULT_VALUES: dict[str, Any] = {
     "train_images_dir": str(SCRIPT_ROOT / "images"),
     "train_annotations_dir": str(SCRIPT_ROOT / "annotations"),
     "train_ratio_percent": "80",
+    "split_mode": "video_group",
     "img_width": "448",
     "img_height": "448",
     "image_resize_mode": "letterbox",
@@ -92,6 +95,16 @@ DEFAULT_VALUES: dict[str, Any] = {
     "test_output_dir": "",
     "camera_index": "0",
     "conf": "0.25",
+    "rknn_onnx": "",
+    "rknn_classes": "",
+    "rknn_python": sys.executable,
+    "rknn_mode": "both",
+    "rknn_calibration_dir": "",
+    "rknn_calibration_count": "200",
+    "rknn_test_image": "",
+    "rknn_conf": "0.25",
+    "rknn_iou": "0.45",
+    "rknn_output_dir": "",
     "label_video_dir": "",
     "label_video": "",
     "label_camera_index": "0",
@@ -142,6 +155,15 @@ STATE: dict[str, Any] = {
         "val_percent": 0.0,
         "metrics": {},
         "history": [],
+        "updated_at": "",
+    },
+    "rknn_progress": {
+        "stage": "idle",
+        "percent": 0,
+        "message": "等待开始",
+        "error_type": "",
+        "error": "",
+        "partial_success": "",
         "updated_at": "",
     },
     "running": False,
@@ -567,6 +589,157 @@ def query_local_resources(cache_seconds: float = 5.0) -> dict[str, Any]:
     return resources
 
 
+def detect_environment() -> dict[str, Any]:
+    """检测当前面板进程实际使用的 Python、YOLO、CUDA 和硬件环境。"""
+    checks: list[dict[str, str]] = []
+
+    def add(label: str, status: str, value: str, detail: str = "") -> None:
+        checks.append({"label": label, "status": status, "value": value, "detail": detail})
+
+    add("Python", "ok", platform.python_version(), sys.executable)
+    add("操作系统", "ok", f"{platform.system()} {platform.release()}", platform.machine())
+    add("CPU", "ok", platform.processor() or platform.machine(), f"{os.cpu_count() or 1} 个逻辑核心")
+    try:
+        import psutil  # type: ignore
+        memory = psutil.virtual_memory()
+        add("系统内存", "ok", f"{memory.total / (1024 ** 3):.1f} GiB", f"可用 {memory.available / (1024 ** 3):.1f} GiB")
+    except Exception:
+        add("系统内存", "warn", "无法检测", "安装 psutil 后可显示内存详情")
+    add("OpenCV", "ok", getattr(cv2, "__version__", "已加载"))
+
+    try:
+        import importlib.metadata as metadata
+        try:
+            yolo_version = metadata.version("ultralytics")
+            try:
+                import ultralytics  # type: ignore
+                yolo_version = str(getattr(ultralytics, "__version__", yolo_version))
+                add("Ultralytics / YOLO", "ok", yolo_version, "模块可正常导入")
+            except Exception as exc:
+                add("Ultralytics / YOLO", "warn", yolo_version, f"已安装但导入失败：{exc}")
+        except metadata.PackageNotFoundError:
+            add("Ultralytics / YOLO", "warn", "未安装", "训练和 .pt 推理需要安装 ultralytics")
+        try:
+            add("NumPy", "ok", metadata.version("numpy"))
+        except metadata.PackageNotFoundError:
+            add("NumPy", "warn", "未安装")
+    except Exception as exc:
+        add("Python 包信息", "warn", "读取失败", str(exc))
+
+    try:
+        import torch
+        torch_version = str(getattr(torch, "__version__", "已加载"))
+        cuda_build = getattr(getattr(torch, "version", None), "cuda", None) or "CPU 构建"
+        if torch.cuda.is_available():
+            count = int(torch.cuda.device_count())
+            names = ", ".join(str(torch.cuda.get_device_name(i)) for i in range(count))
+            add("PyTorch", "ok", torch_version, f"CUDA 构建 {cuda_build}")
+            add("CUDA / GPU", "ok", f"可用 · {count} 个 GPU", names)
+        else:
+            add("PyTorch", "ok", torch_version, f"CUDA 构建 {cuda_build}")
+            add("CUDA / GPU", "warn", "不可用", "PyTorch 未检测到可用 CUDA；可使用 CPU 训练")
+    except Exception as exc:
+        add("PyTorch", "warn", "未安装或加载失败", str(exc))
+        add("CUDA / GPU", "warn", "无法检测", "请安装匹配驱动和 PyTorch")
+
+    try:
+        nvcc = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=2, check=False)
+        match = re.search(r"release\s+([0-9.]+)", nvcc.stdout or "")
+        if match:
+            add("CUDA Toolkit", "ok", match.group(1), "nvcc 已在 PATH 中")
+        else:
+            add("CUDA Toolkit", "warn", "未找到 nvcc", "不影响使用随 PyTorch 提供的 CUDA runtime")
+    except (OSError, subprocess.SubprocessError):
+        add("CUDA Toolkit", "warn", "未找到 nvcc", "不影响使用随 PyTorch 提供的 CUDA runtime")
+
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        rows = [row.strip() for row in (smi.stdout or "").splitlines() if row.strip()]
+        if rows:
+            add("NVIDIA 驱动", "ok", f"{len(rows)} 个 GPU", "；".join(rows))
+        else:
+            add("NVIDIA 驱动", "warn", "未检测到", "nvidia-smi 无可用 GPU 输出")
+    except (OSError, subprocess.SubprocessError):
+        add("NVIDIA 驱动", "warn", "未找到 nvidia-smi")
+
+    ok_count = sum(item["status"] == "ok" for item in checks)
+    warn_count = sum(item["status"] == "warn" for item in checks)
+    return {
+        "checks": checks,
+        "summary": {"ok": ok_count, "warn": warn_count, "total": len(checks)},
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _torch_cuda_variant(cuda_version: Any) -> str:
+    """将 PyTorch 的 CUDA runtime 版本映射为面板支持的安装选项。"""
+    match = re.search(r"(\d+)\.(\d+)", str(cuda_version or ""))
+    if not match:
+        return "none"
+    major, minor = int(match.group(1)), int(match.group(2))
+    supported = {(11, 8): "cu118", (12, 1): "cu121", (12, 4): "cu124", (12, 8): "cu128"}
+    # 未知 runtime 不强行降级或升级当前 PyTorch，交给用户保留现有环境。
+    return supported.get((major, minor), "none")
+
+
+def recommend_train_config() -> dict[str, Any]:
+    """根据当前面板进程的硬件和 Python 环境生成保守的训练配置。"""
+    resources = query_local_resources()
+    cuda_available = False
+    cuda_runtime = ""
+    gpu_count = 0
+    try:
+        import torch  # type: ignore
+
+        cuda_available = bool(torch.cuda.is_available())
+        cuda_runtime = str(getattr(getattr(torch, "version", None), "cuda", "") or "")
+        gpu_count = int(torch.cuda.device_count()) if cuda_available else 0
+    except Exception:
+        pass
+
+    train_device = "cuda" if cuda_available and gpu_count else "cpu"
+    torch_cuda = _torch_cuda_variant(cuda_runtime) if train_device == "cuda" else "cpu"
+    gpu_total = parse_float(str(resources.get("gpu_total_gib", "")))
+    if train_device == "cpu":
+        batch = 2
+    elif gpu_total is None or gpu_total < 4:
+        batch = 4
+    elif gpu_total < 8:
+        batch = 8
+    elif gpu_total < 12:
+        batch = 16
+    elif gpu_total < 20:
+        batch = 32
+    else:
+        batch = 64
+
+    conda_env = (os.environ.get("CONDA_DEFAULT_ENV") or "").strip()
+    if not conda_env and sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        conda_env = Path(sys.prefix).name
+    # 关闭内存 cache 是跨机器最稳妥的默认值，避免自动填入后立即耗尽 RAM。
+    config = {
+        "conda_env": conda_env,
+        "torch_cuda": torch_cuda,
+        "train_device": train_device,
+        "batch": str(batch),
+        "train_cache": "False",
+    }
+    details = {
+        "python": sys.executable,
+        "conda_env": conda_env or "未使用 conda 环境",
+        "cuda_runtime": cuda_runtime or ("不可用" if train_device == "cpu" else "未知"),
+        "gpu_count": gpu_count,
+        "gpu_name": resources.get("gpu_name", ""),
+        "gpu_total_gib": gpu_total,
+        "ram_total_gib": resources.get("ram_total_gib"),
+        "ram_available_gib": resources.get("ram_available_gib"),
+    }
+    return {"values": config, "details": details, "generated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
 
 def image_dimensions(values: dict[str, Any]) -> tuple[int, int]:
     width = max(32, parse_int(str(values.get("img_width", ""))) or 448)
@@ -847,11 +1020,21 @@ def parse_train_output(line: str) -> None:
 def parse_marker(line: str) -> None:
     markers = {
         "TRAIN_MODEL_ONNX=": "train_model_onnx",
+        "TRAIN_CLASSES=": "train_classes",
         "TRAIN_PLOT_DIR=": "train_plot_dir",
         "TRAIN_MODEL_PT=": "test_model",
         "TRAIN_STOP_EXPORT_REQUESTED=": "stop_export",
         "TEST_OUTPUT_IMAGE=": "test_output_image",
-
+        "RKNN_INPUT_NAME=": "rknn_input_name",
+        "RKNN_INPUT_SIZE=": "rknn_input_size",
+        "RKNN_OUTPUT_SHAPE=": "rknn_output_shape",
+        "RKNN_ONNX_OPSET=": "rknn_onnx_opset",
+        "RKNN_CLASS_COUNT=": "rknn_class_count",
+        "RKNN_CALIBRATION_COUNT=": "rknn_calibration_used",
+        "RKNN_MODEL_FP=": "rknn_model_fp",
+        "RKNN_MODEL_INT8=": "rknn_model_int8",
+        "RKNN_PACKAGE=": "rknn_package",
+        "RKNN_MANIFEST=": "rknn_manifest",
     }
     with STATE_LOCK:
         for prefix, key in markers.items():
@@ -860,7 +1043,50 @@ def parse_marker(line: str) -> None:
                 STATE["markers"][key] = value
                 if key in STATE["values"]:
                     STATE["values"][key] = value
+                if key == "train_model_onnx" and not STATE["values"].get("rknn_onnx", "").strip():
+                    STATE["values"]["rknn_onnx"] = value
+                elif key == "train_classes" and not STATE["values"].get("rknn_classes", "").strip():
+                    STATE["values"]["rknn_classes"] = value
                 return
+
+
+def reset_rknn_progress_locked() -> None:
+    STATE["rknn_progress"] = {
+        "stage": "pending",
+        "percent": 0,
+        "message": "等待转换进程启动",
+        "error_type": "",
+        "error": "",
+        "partial_success": "",
+        "updated_at": time.strftime("%H:%M:%S"),
+    }
+
+
+def parse_rknn_output(line: str) -> None:
+    stage_names = {
+        "check_environment": ("检查环境", 8),
+        "check_onnx": ("检查 ONNX", 20),
+        "build_fp": ("构建 FP", 40),
+        "build_int8": ("构建 INT8", 65),
+        "package": ("生成部署包", 85),
+        "complete": ("完成", 100),
+    }
+    clean = strip_ansi(line).strip()
+    now = time.strftime("%H:%M:%S")
+    with STATE_LOCK:
+        progress = STATE["rknn_progress"]
+        if clean.startswith("RKNN_STAGE="):
+            value = clean.split("=", 1)[1].strip()
+            message, percent = stage_names.get(value, (value, progress.get("percent", 0)))
+            progress.update({"stage": value, "message": message, "percent": percent, "updated_at": now})
+        elif clean.startswith("RKNN_ERROR_TYPE="):
+            progress.update({"error_type": clean.split("=", 1)[1].strip(), "updated_at": now})
+        elif clean.startswith("RKNN_ERROR="):
+            error = clean.split("=", 1)[1].strip()
+            progress.update({"error": error, "message": error, "updated_at": now})
+        elif clean.startswith("RKNN_PARTIAL_SUCCESS="):
+            value = clean.split("=", 1)[1].strip()
+            progress.update({"partial_success": value, "message": "非量化模型可用，INT8 失败", "updated_at": now})
 
 
 def build_common_args(values: dict[str, Any], stage: str) -> list[Any]:
@@ -873,6 +1099,7 @@ def build_common_args(values: dict[str, Any], stage: str) -> list[Any]:
         "--images-dir", values["train_images_dir"],
         "--annotations-dir", values["train_annotations_dir"],
         "--train-ratio-percent", values["train_ratio_percent"],
+        "--split-mode", values["split_mode"],
         "--img-width", values["img_width"],
         "--img-height", values["img_height"],
         "--image-resize-mode", values["image_resize_mode"],
@@ -940,6 +1167,30 @@ def build_label_cmd(values: dict[str, Any]) -> list[Any]:
     return cmd
 
 
+def build_rknn_cmd(values: dict[str, Any], check_only: bool = False) -> list[Any]:
+    cmd = [
+        str(Path(values["rknn_python"]).expanduser()),
+        str(RKNN_DEPLOY_SCRIPT),
+        "--onnx", values["rknn_onnx"],
+        "--classes", values["rknn_classes"],
+    ]
+    if check_only:
+        return cmd + ["--check-only"]
+    cmd += [
+        "--mode", values["rknn_mode"],
+        "--calibration-count", values["rknn_calibration_count"],
+        "--conf", values["rknn_conf"],
+        "--iou", values["rknn_iou"],
+    ]
+    if values["rknn_output_dir"].strip():
+        cmd += ["--output-dir", values["rknn_output_dir"]]
+    if values["rknn_mode"] in {"int8", "both"}:
+        cmd += ["--calibration-dir", values["rknn_calibration_dir"]]
+    if values["rknn_test_image"].strip():
+        cmd += ["--test-image", values["rknn_test_image"]]
+    return cmd
+
+
 
 def command_for(action: str, values: dict[str, Any]) -> list[Any]:
 
@@ -949,6 +1200,8 @@ def command_for(action: str, values: dict[str, Any]) -> list[Any]:
         return build_test_cmd(values)
     if action == "label":
         return build_label_cmd(values)
+    if action == "rknn_deploy":
+        return build_rknn_cmd(values)
     raise ValueError(f"unknown action: {action}")
 
 
@@ -1006,6 +1259,45 @@ def validate(action: str, values: dict[str, Any]) -> None:
             raise ValueError("请先从视频队列选择或填写视频路径。")
         if not values["label_name"].strip():
             raise ValueError("请先填写至少一个标签名称。")
+    elif action == "rknn_deploy":
+        if not RKNN_DEPLOY_SCRIPT.is_file():
+            raise ValueError(f"未找到 RKNN 转换工具：{RKNN_DEPLOY_SCRIPT}")
+        python_path = Path(values["rknn_python"].strip()).expanduser()
+        if not python_path.is_file() or not os.access(python_path, os.X_OK):
+            raise ValueError("RKNN Python 必须是存在且可执行的 Python 文件。")
+        onnx_path = Path(values["rknn_onnx"].strip()).expanduser()
+        if not onnx_path.is_file() or onnx_path.suffix.lower() != ".onnx":
+            raise ValueError("ONNX 模型必须是存在的 .onnx 文件。")
+        classes_raw = values["rknn_classes"].strip()
+        classes_path = Path(classes_raw).expanduser() if classes_raw else onnx_path.parent / "classes.txt"
+        if not classes_path.is_file():
+            raise ValueError("类别文件必须存在，通常为 ONNX 同目录的 classes.txt。")
+        values["rknn_classes"] = str(classes_path.resolve())
+        mode = values.get("rknn_mode", "both")
+        if mode not in {"fp", "int8", "both"}:
+            raise ValueError("RKNN 转换模式必须为 fp、int8 或 both。")
+        count = parse_int(values.get("rknn_calibration_count", ""))
+        if count is None or not 20 <= count <= 1000:
+            raise ValueError("校准图片数量必须在 20 到 1000 之间。")
+        if mode in {"int8", "both"} and not Path(values["rknn_calibration_dir"].strip()).expanduser().is_dir():
+            raise ValueError("INT8 转换需要有效的校准图片目录。")
+        test_image = values.get("rknn_test_image", "").strip()
+        if test_image and not Path(test_image).expanduser().is_file():
+            raise ValueError("测试图片路径无效。")
+        for key, label in (("rknn_conf", "置信度阈值"), ("rknn_iou", "NMS IoU")):
+            value = parse_float(values.get(key, ""))
+            if value is None or not 0 < value <= 1:
+                raise ValueError(f"{label}必须大于 0 且不超过 1。")
+        output_raw = values.get("rknn_output_dir", "").strip()
+        if output_raw:
+            output_path = Path(output_raw).expanduser()
+            if output_path.exists() and not output_path.is_dir():
+                raise ValueError("RKNN 输出目录不能指向普通文件。")
+            parent = output_path
+            while not parent.exists() and parent != parent.parent:
+                parent = parent.parent
+            if not parent.is_dir() or not os.access(parent, os.W_OK):
+                raise ValueError("RKNN 输出目录的上级目录不可写。")
 
 
 def start_job(action: str, values: dict[str, Any]) -> None:
@@ -1035,6 +1327,14 @@ def start_job(action: str, values: dict[str, Any]) -> None:
                 pass
             STATE["train_progress"]["phase"] = "pending"
             STATE["train_progress"]["updated_at"] = time.strftime("%H:%M:%S")
+        elif action == "rknn_deploy":
+            reset_rknn_progress_locked()
+            for key in (
+                "rknn_input_name", "rknn_input_size", "rknn_output_shape", "rknn_onnx_opset",
+                "rknn_class_count", "rknn_calibration_used", "rknn_model_fp", "rknn_model_int8",
+                "rknn_package", "rknn_manifest",
+            ):
+                STATE["markers"].pop(key, None)
 
 
 
@@ -1080,18 +1380,28 @@ def start_job(action: str, values: dict[str, Any]) -> None:
                             parse_marker(line.strip())
                             if action == "train":
                                 parse_train_output(line)
+                            elif action == "rknn_deploy":
+                                parse_rknn_output(line)
                 if buffer:
                     line = decode_process_output(bytes(buffer))
                     append_log(line)
                     parse_marker(line.strip())
                     if action == "train":
                         parse_train_output(line)
+                    elif action == "rknn_deploy":
+                        parse_rknn_output(line)
 
             code = proc.wait()
 
             with STATE_LOCK:
                 stopped = stop_requested
                 STATE["exit_code"] = code
+                if action == "rknn_deploy":
+                    progress = STATE["rknn_progress"]
+                    if stopped:
+                        progress.update({"stage": "stopped", "message": "转换已停止", "updated_at": time.strftime("%H:%M:%S")})
+                    elif code != 0 and not progress.get("error"):
+                        progress.update({"message": "转换失败，请查看完整日志", "updated_at": time.strftime("%H:%M:%S")})
             if stopped:
                 append_log(f"\n[stopped, exit code {code}]\n")
             else:
@@ -1101,6 +1411,13 @@ def start_job(action: str, values: dict[str, Any]) -> None:
                 stopped = stop_requested
                 STATE["exit_code"] = -15 if stopped else -1
                 STATE["last_error"] = "" if stopped else str(exc)
+                if action == "rknn_deploy":
+                    STATE["rknn_progress"].update({
+                        "stage": "stopped" if stopped else "failed",
+                        "message": "转换已停止" if stopped else f"转换进程启动失败：{exc}",
+                        "error": "" if stopped else str(exc),
+                        "updated_at": time.strftime("%H:%M:%S"),
+                    })
             if stopped:
                 append_log("\n[stopped]\n")
             else:
@@ -1542,6 +1859,28 @@ def pick_image_file(initial_path: str = "") -> str:
     return selected
 
 
+def pick_file(initial_path: str, title: str, filetypes: list[tuple[str, str]]) -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("当前环境不支持系统文件选择器，请手动粘贴文件路径。") from exc
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    initial_dir = str(Path(initial_path).expanduser().parent) if initial_path else str(SCRIPT_ROOT)
+    if not Path(initial_dir).is_dir():
+        initial_dir = str(SCRIPT_ROOT)
+    selected = filedialog.askopenfilename(
+        parent=root,
+        initialdir=initial_dir,
+        title=title,
+        filetypes=filetypes,
+    )
+    root.destroy()
+    return selected
+
+
 def pick_directory(initial_dir: str = "", title: str = "选择文件夹") -> str:
     try:
         import tkinter as tk
@@ -1555,6 +1894,91 @@ def pick_directory(initial_dir: str = "", title: str = "选择文件夹") -> str
     selected = filedialog.askdirectory(parent=root, initialdir=start, title=title)
     root.destroy()
     return selected
+
+
+def validate_rknn_python(value: str) -> Path:
+    python_path = Path(value.strip()).expanduser()
+    if not python_path.is_file() or not os.access(python_path, os.X_OK):
+        raise ValueError("RKNN Python 必须是存在且可执行的 Python 文件。")
+    return python_path
+
+
+def run_rknn_check(values: dict[str, Any], environment_only: bool) -> dict[str, Any]:
+    python_path = validate_rknn_python(values.get("rknn_python", ""))
+    if not RKNN_DEPLOY_SCRIPT.is_file():
+        raise ValueError(f"未找到 RKNN 转换工具：{RKNN_DEPLOY_SCRIPT}")
+    if environment_only:
+        cmd = [str(python_path), str(RKNN_DEPLOY_SCRIPT), "--check-environment"]
+        timeout = 30
+    else:
+        onnx_path = Path(values.get("rknn_onnx", "").strip()).expanduser()
+        classes_raw = values.get("rknn_classes", "").strip()
+        classes_path = Path(classes_raw).expanduser() if classes_raw else onnx_path.parent / "classes.txt"
+        if not onnx_path.is_file() or onnx_path.suffix.lower() != ".onnx":
+            raise ValueError("请先选择有效的 .onnx 模型。")
+        if not classes_path.is_file():
+            raise ValueError("请先选择有效的 classes.txt。")
+        values["rknn_classes"] = str(classes_path.resolve())
+        cmd = build_rknn_cmd(values, check_only=True)
+        timeout = 120
+    try:
+        completed = subprocess.run(
+            [str(item) for item in cmd],
+            cwd=str(SCRIPT_ROOT),
+            env=subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"RKNN {'环境' if environment_only else '模型'}检查超时。") from exc
+    output = decode_process_output(completed.stdout or b"")
+    markers: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("RKNN_") and "=" in line:
+            key, value = line.split("=", 1)
+            markers[key] = value.strip()
+    result: dict[str, Any] = {
+        "ok": completed.returncode == 0,
+        "exit_code": completed.returncode,
+        "output": output,
+        "error_type": markers.get("RKNN_ERROR_TYPE", ""),
+        "error": markers.get("RKNN_ERROR", ""),
+        "classes": values.get("rknn_classes", ""),
+    }
+    json_key = "RKNN_ENVIRONMENT_JSON" if environment_only else "RKNN_MODEL_INFO_JSON"
+    if markers.get(json_key):
+        try:
+            result["info"] = json.loads(markers[json_key])
+        except json.JSONDecodeError:
+            result["info"] = {}
+    return result
+
+
+def send_rknn_package(handler: BaseHTTPRequestHandler) -> None:
+    with STATE_LOCK:
+        if STATE.get("job") != "rknn_deploy":
+            raise ValueError("当前任务没有可下载的 RKNN 部署包。")
+        package_raw = str(STATE["markers"].get("rknn_package", "")).strip()
+    if not package_raw:
+        raise ValueError("当前 RKNN 任务尚未生成部署包。")
+    package_path = Path(package_raw).expanduser().resolve()
+    if not package_path.is_file() or package_path.suffix.lower() != ".zip":
+        raise ValueError("当前任务记录的部署包不存在。")
+    size = package_path.stat().st_size
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "application/zip")
+    handler.send_header("Content-Disposition", 'attachment; filename="rk3588_deploy.zip"')
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(size))
+    handler.end_headers()
+    with package_path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
 
 
 def read_video_preview_frame(video_path: Path):
@@ -1709,11 +2133,15 @@ HTML_PAGE = r'''<!doctype html>
 <style>
 #label-stage #label-frame-image { pointer-events: none; -webkit-user-drag: none; }
 #label-stage #label-frame-canvas { right: auto; bottom: auto; user-select: none; }
+.environment-dialog{position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:22px;background:rgba(2,6,14,.78);backdrop-filter:blur(8px)}.environment-dialog[hidden]{display:none}.environment-content{width:min(760px,100%);max-height:min(760px,calc(100vh - 44px));overflow:auto;padding:24px;border:1px solid rgba(255,255,255,.2);border-radius:22px;background:#101d33;box-shadow:0 24px 80px rgba(0,0,0,.55)}.environment-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.environment-head h2{margin:0 0 6px;font-size:22px}.environment-head p{margin:0;color:var(--muted);font-size:13px}.environment-close{all:unset;cursor:pointer;width:36px;height:36px;display:grid;place-items:center;border-radius:12px;border:1px solid var(--line);color:var(--text);font-size:22px}.environment-close:hover{background:rgba(255,102,120,.2)}.environment-summary{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 12px}.environment-summary span{padding:7px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted)}.environment-summary .good{color:#bff8dc;border-color:rgba(48,210,135,.35);background:rgba(48,210,135,.1)}.environment-summary .warning{color:#ffe5ad;border-color:rgba(255,189,90,.35);background:rgba(255,189,90,.1)}.environment-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.environment-item{padding:13px;border-radius:15px;border:1px solid var(--line);background:rgba(255,255,255,.05);min-width:0}.environment-item-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.environment-item b{font-size:13px}.environment-item strong{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.environment-item p{margin:7px 0 0;color:var(--muted);font-size:12px;line-height:1.45;overflow-wrap:anywhere}.environment-item.ok{border-color:rgba(48,210,135,.3)}.environment-item.warn{border-color:rgba(255,189,90,.35)}.environment-item.error{border-color:rgba(255,102,120,.35)}.environment-item.ok strong{color:#bff8dc}.environment-item.warn strong{color:#ffe5ad}.environment-item.error strong{color:#ffd7dd}.environment-loading{padding:26px;text-align:center;color:var(--muted)}@media(max-width:640px){.environment-list{grid-template-columns:1fr}}
+.log-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) 150px auto auto;gap:10px;align-items:end;margin:18px 0 12px}.log-control{display:grid;gap:6px;min-width:0}.log-control label{margin:0}.log-control input,.log-control select{height:42px}.log-follow{display:flex;align-items:center;gap:8px;height:42px;margin:0;padding:0 12px;border:1px solid var(--line);border-radius:14px;background:rgba(5,12,24,.5);white-space:nowrap;cursor:pointer}.log-follow input{width:16px;height:16px;margin:0;padding:0;accent-color:var(--blue)}.log-toolbar .btns{flex-wrap:nowrap}.log-toolbar .btn{min-height:42px;padding:0 14px;display:grid;place-items:center;white-space:nowrap}.log-toolbar .btn:disabled{cursor:not-allowed;opacity:.45}.log-summary{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:0 2px 8px;color:var(--muted);font-size:12px}.log-summary span:last-child{text-align:right}.log-alert{margin-bottom:10px;padding:11px 13px;border-radius:12px;border:1px solid rgba(255,102,120,.38);background:rgba(255,102,120,.12);color:#ffd7dd;font-size:13px;line-height:1.5;overflow-wrap:anywhere}.log-alert.warn{border-color:rgba(255,189,90,.38);background:rgba(255,189,90,.1);color:#ffe5ad}.log-alert[hidden]{display:none}.log{height:min(62vh,640px);min-height:360px}.log:focus-visible{border-color:rgba(86,168,255,.72);box-shadow:0 0 0 4px rgba(86,168,255,.13);outline:none}@media(max-width:880px){.log-toolbar{grid-template-columns:minmax(0,1fr) 140px}.log-toolbar .btns{justify-content:flex-end}}@media(max-width:560px){.log-toolbar{grid-template-columns:1fr}.log-toolbar .btns{justify-content:stretch;display:grid;grid-template-columns:1fr 1fr}.log-follow{justify-content:center}.log-summary{align-items:flex-start;flex-direction:column;gap:4px}.log-summary span:last-child{text-align:left}.log{height:55vh;min-height:320px}}
+.btn:disabled{cursor:not-allowed;opacity:.45}.rknn-status{margin-top:18px;padding:14px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.rknn-stage-track{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}.rknn-stage{min-width:0;padding:9px 7px;border:1px solid var(--line);border-radius:8px;color:var(--muted);font-size:11px;text-align:center;line-height:1.35}.rknn-stage.active{color:#eff8ff;border-color:rgba(86,168,255,.72);background:rgba(86,168,255,.16)}.rknn-stage.done{color:#bff8dc;border-color:rgba(48,210,135,.4);background:rgba(48,210,135,.08)}.rknn-stage.skipped{opacity:.42}.rknn-progress-line{display:flex;justify-content:space-between;gap:12px;margin-top:10px;color:var(--muted);font-size:12px}.rknn-check-result{margin-top:14px;padding:12px 14px;border-left:3px solid var(--blue);background:rgba(5,12,24,.45);color:var(--muted);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.rknn-check-result.ok{border-color:var(--green);color:#bff8dc}.rknn-check-result.error{border-color:var(--red);color:#ffd7dd}.rknn-check-result[hidden],.rknn-calibration[hidden],.rknn-artifacts[hidden]{display:none}.rknn-artifacts{margin-top:18px;padding-top:16px;border-top:1px solid var(--line)}.rknn-artifacts h3{margin:0 0 10px;font-size:16px}.rknn-artifact-list{display:grid;gap:7px;margin-bottom:12px}.rknn-artifact{display:grid;grid-template-columns:120px minmax(0,1fr);gap:10px;font-size:12px}.rknn-artifact span{color:var(--muted)}.rknn-artifact b{overflow-wrap:anywhere;word-break:break-all}.rknn-warning{color:#ffe5ad}@media(max-width:720px){.rknn-stage-track{grid-template-columns:repeat(3,minmax(0,1fr))}.rknn-progress-line{flex-direction:column;gap:4px}.rknn-artifact{grid-template-columns:1fr;gap:3px}}
 </style>
 </head>
 <body>
 <div id="image-lightbox" class="image-lightbox" hidden role="dialog" aria-modal="true" aria-label="标注图片预览"><div class="image-lightbox-content"><button id="image-lightbox-close" class="image-lightbox-close" type="button" aria-label="关闭图片预览" title="关闭（Esc）">×</button><img id="image-lightbox-image" alt="标注结果放大预览"><div id="image-lightbox-title" class="image-lightbox-title"></div></div></div>
 <div id="label-choice-dialog" class="label-choice-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="label-choice-title"><div class="label-choice-content"><h3 id="label-choice-title">选择目标标签</h3><p>请选择刚刚绘制的标注框所属类别。</p><div id="label-choice-options" class="label-choice-options"></div><button id="label-choice-cancel" class="btn" type="button">取消</button></div></div>
+<div id="environment-dialog" class="environment-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="environment-title"><div class="environment-content"><div class="environment-head"><div><h2 id="environment-title">当前电脑环境</h2><p id="environment-time">点击检测按钮开始读取本机运行环境。</p></div><button id="environment-close" class="environment-close" type="button" aria-label="关闭环境检测">×</button></div><div id="environment-summary" class="environment-summary"></div><div id="environment-list" class="environment-list"><div class="environment-loading">尚未检测</div></div></div></div>
 <div class="wrap">
   <div class="hero">
     <div class="card title">
@@ -1721,6 +2149,7 @@ HTML_PAGE = r'''<!doctype html>
 
       <h1>model-training-tool</h1>
       <p class="subtitle">按“准备数据 → 训练模型 → 测试效果”的顺序完成流程。</p>
+      <div class="actions"><div class="btns"><button id="environment-button" class="btn blue" type="button">检测当前环境</button><button id="environment-fill-button" class="btn" type="button">自动填入训练配置</button></div><span class="mini">检测 Python、PyTorch、CUDA、GPU 和内存，并按当前环境设置训练参数</span></div>
     </div>
     <div class="card guide">
       <div class="steps">
@@ -1736,8 +2165,9 @@ HTML_PAGE = r'''<!doctype html>
       <div class="nav">
         <button data-tab="train" class="active">训练配置 <span>01</span></button>
         <button data-tab="test">模型测试 <span>02</span></button>
-        <button data-tab="label">视频打标 <span>03</span></button>
-        <button data-tab="logs">运行日志 <span>04</span></button>
+        <button data-tab="rknn">RK3588 转换 <span>03</span></button>
+        <button data-tab="label">视频打标 <span>04</span></button>
+        <button data-tab="logs">运行日志 <span>05</span></button>
 
       </div>
       <div class="status">
@@ -1756,6 +2186,7 @@ HTML_PAGE = r'''<!doctype html>
           <div class="field"><label>Images Dir</label><input id="train_images_dir" placeholder="例如 E:/dataset/images"></div>
           <div class="field" id="annotations-field"><label>Annotations Dir</label><input id="train_annotations_dir" placeholder="例如 E:/dataset/annotations"></div>
           <div class="field full"><label>训练集 / 验证集比例：<span id="split_ratio_text">训练 80% / 验证 20%</span></label><input id="train_ratio_percent" type="range" min="1" max="100" step="1"><div class="mini">拖动条表示训练集占比，验证集占比自动为剩余比例；建议常用 80% / 20%。</div></div>
+          <div class="field full"><label>数据划分方式</label><select id="split_mode"><option value="video_group">按视频源分组（推荐）</option><option value="random">逐图片随机</option></select><div class="mini" id="split-mode-hint">视频分组会把“视频前缀_000015.jpg”末尾的帧号去掉，并保证同一视频只进入训练集或验证集；独立图片集才使用逐图片随机。</div></div>
           <div class="field"><label>Base Model</label><input id="base_model"></div>
 
           <div class="field"><label>Conda Env</label><input id="conda_env"></div>
@@ -1842,6 +2273,37 @@ HTML_PAGE = r'''<!doctype html>
         </div>
         <div class="actions"><button class="btn" onclick="copyCommand('test')">复制测试命令</button><button class="btn primary" onclick="runAction('test')">开始测试</button></div>
         <div class="cmd" id="cmd-test"></div>
+      </section>
+
+      <section id="tab-rknn" class="tab card section">
+        <h2>RK3588 转换与打包</h2><p class="hint">在独立 RKNN-Toolkit2 环境中检查 ONNX、生成 RKNN 模型和板端单图片示例。Toolkit2 必须与开发板 Runtime/RKNPU 驱动匹配。</p>
+        <div class="grid">
+          <div class="field full"><label>ONNX 模型</label><div class="input-action"><input id="rknn_onnx" placeholder="选择训练导出的静态 .onnx"><button class="btn" type="button" onclick="pickRknnOnnx()">选择模型</button></div></div>
+          <div class="field full"><label>类别文件</label><div class="input-action"><input id="rknn_classes" placeholder="默认寻找 ONNX 同目录的 classes.txt"><button class="btn" type="button" onclick="pickRknnClasses()">选择文件</button></div></div>
+          <div class="field full"><label>RKNN Python</label><input id="rknn_python" placeholder="例如 /home/user/rknn-env/bin/python"><div class="mini">使用板卡厂商 SDK 配套的独立环境；根目录 requirements.txt 不安装 RKNN-Toolkit2。</div></div>
+          <div class="field"><label>目标平台</label><input value="RK3588 / RK3588S（rk3588）" readonly data-local-control></div>
+          <div class="field"><label>转换模式</label><select id="rknn_mode"><option value="both">先 FP，再 INT8（推荐）</option><option value="fp">仅非量化 FP</option><option value="int8">仅 INT8</option></select></div>
+          <div class="field rknn-calibration"><label>校准图片目录</label><div class="input-action"><input id="rknn_calibration_dir" placeholder="递归读取 JPG、PNG、BMP、WEBP"><button class="btn" type="button" onclick="pickRknnCalibration()">选择目录</button></div></div>
+          <div class="field rknn-calibration"><label>校准图片数量</label><input id="rknn_calibration_count" type="number" min="20" max="1000" step="1"><div id="rknn-calibration-warning" class="mini rknn-warning"></div></div>
+          <div class="field full"><label>测试图片（可选）</label><div class="input-action"><input id="rknn_test_image" placeholder="用于转换后的模拟推理检查"><button class="btn" type="button" onclick="pickRknnTestImage()">选择图片</button></div></div>
+          <div class="field sm"><label>置信度阈值</label><input id="rknn_conf" type="number" min="0.01" max="1" step="0.01"></div>
+          <div class="field sm"><label>NMS IoU</label><input id="rknn_iou" type="number" min="0.01" max="1" step="0.01"></div>
+          <div class="field"><label>输出目录（可选）</label><div class="input-action"><input id="rknn_output_dir" placeholder="留空时在 ONNX 同目录创建时间戳目录"><button class="btn" type="button" onclick="pickRknnOutput()">选择目录</button></div></div>
+        </div>
+        <div class="actions"><div class="btns"><button id="rknn-env-button" class="btn blue" type="button" onclick="checkRknnEnvironment()">检查环境</button><button id="rknn-model-button" class="btn" type="button" onclick="checkRknnModel()">检查模型</button><button class="btn" type="button" onclick="saveDefaults('RK3588 转换配置')">存为默认</button></div><button id="rknn-start-button" class="btn green" type="button" onclick="runAction('rknn_deploy')">开始转换并打包</button></div>
+        <div id="rknn-check-result" class="rknn-check-result" hidden aria-live="polite"></div>
+        <div class="rknn-status">
+          <div class="rknn-stage-track" id="rknn-stage-track">
+            <div class="rknn-stage" data-stage="check_environment">检查环境</div><div class="rknn-stage" data-stage="check_onnx">检查 ONNX</div><div class="rknn-stage" data-stage="build_fp">构建 FP</div><div class="rknn-stage" data-stage="build_int8">构建 INT8</div><div class="rknn-stage" data-stage="package">生成部署包</div><div class="rknn-stage" data-stage="complete">完成</div>
+          </div>
+          <div class="rknn-progress-line"><span id="rknn-progress-message">等待开始</span><span id="rknn-progress-percent">0%</span></div>
+        </div>
+        <div id="rknn-artifacts" class="rknn-artifacts" hidden>
+          <h3>当前任务产物</h3>
+          <div id="rknn-artifact-list" class="rknn-artifact-list"></div>
+          <button id="rknn-download-button" class="btn green" type="button" onclick="downloadRknnPackage()" disabled>下载部署包</button>
+        </div>
+        <div class="cmd" id="cmd-rknn"></div>
       </section>
 
       <section id="tab-label" class="tab card section">
@@ -1941,8 +2403,15 @@ HTML_PAGE = r'''<!doctype html>
 
       <section id="tab-logs" class="tab card section">
         <h2>运行日志</h2><p class="hint">这里实时显示训练、模型测试和视频打标输出。</p>
-        <div class="actions"><div class="btns"><button class="btn" onclick="refreshState()">刷新</button><button class="btn" onclick="copyLogs()">复制日志</button></div><button class="btn red" onclick="stopJob()">停止当前任务</button></div>
-        <div class="log" id="log"></div>
+        <div class="log-toolbar">
+          <div class="log-control"><label for="log-search">搜索日志</label><input id="log-search" data-local-control type="search" placeholder="输入关键词筛选当前日志"></div>
+          <div class="log-control"><label for="log-level">显示级别</label><select id="log-level" data-local-control><option value="all">全部日志</option><option value="error">仅错误</option><option value="warning">仅警告</option></select></div>
+          <label class="log-follow"><input id="log-follow" data-local-control type="checkbox" checked>跟随最新</label>
+          <div class="btns"><button class="btn" type="button" onclick="refreshState(true)">刷新</button><button class="btn" type="button" onclick="copyLogs()">复制当前视图</button><button class="btn" type="button" onclick="downloadLogs()">下载完整日志</button><button id="stop-job-button" class="btn red" type="button" onclick="stopJob()" disabled>停止任务</button></div>
+        </div>
+        <div id="log-alert" class="log-alert" hidden role="alert"></div>
+        <div class="log-summary" aria-live="polite"><span id="log-count">0 行</span><span id="log-follow-status">正在跟随最新日志</span></div>
+        <div class="log" id="log" tabindex="0" aria-label="任务运行日志"></div>
       </section>
 
     </main>
@@ -1950,7 +2419,7 @@ HTML_PAGE = r'''<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','train_ratio_percent','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
+const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','train_ratio_percent','split_mode','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','rknn_onnx','rknn_classes','rknn_python','rknn_mode','rknn_calibration_dir','rknn_calibration_count','rknn_test_image','rknn_conf','rknn_iou','rknn_output_dir','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
 
 
 
@@ -1964,16 +2433,28 @@ let labelResultsTimer=null;
 let resourceEstimateTimer=null;
 let lastResourceEstimateKey='';
 let deleteConfirmUntil=0;
+let rawLogText='';
+let visibleLogText='';
+let currentLogJob='';
+let logAutoScrolling=false;
+let logInitialized=false;
+const LOG_ERROR_PATTERN=/(?:\berror\b|\bexception\b|traceback|\bfailed\b|失败|错误|异常)/i;
+const LOG_WARNING_PATTERN=/(?:\bwarn(?:ing)?\b|警告|注意)/i;
 
 
 const rawLabelPrefix={manual:false,value:''};
 function toast(msg){const el=document.getElementById('toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2600)}
+async function checkEnvironment(){const dialog=document.getElementById('environment-dialog'); const list=document.getElementById('environment-list'); const summary=document.getElementById('environment-summary'); const time=document.getElementById('environment-time'); if(!dialog||!list) return; dialog.hidden=false; document.body.style.overflow='hidden'; list.innerHTML='<div class="environment-loading">正在检测当前 Python、YOLO、CUDA 和 GPU 环境...</div>'; summary.innerHTML=''; time.textContent='检测中...'; try{const j=await api('/api/environment'); const items=j.checks||[]; const s=j.summary||{}; summary.innerHTML=`<span class="good">正常 ${Number(s.ok||0)}</span><span class="warning">需注意 ${Number(s.warn||0)}</span><span>共 ${Number(s.total||items.length)} 项</span>`; time.textContent=`检测时间：${j.generated_at||'-'}`; list.innerHTML=''; items.forEach(item=>{const card=document.createElement('div'); card.className=`environment-item ${item.status||'warn'}`; const head=document.createElement('div'); head.className='environment-item-head'; const label=document.createElement('b'); label.textContent=item.label||'环境项'; const value=document.createElement('strong'); value.textContent=item.value||'-'; head.append(label,value); const detail=document.createElement('p'); detail.textContent=item.detail||''; card.append(head,detail); list.appendChild(card)}); if(!items.length) list.innerHTML='<div class="environment-loading">没有获取到环境信息。</div>'}catch(e){time.textContent='检测失败'; list.innerHTML=''; const error=document.createElement('div'); error.className='environment-loading'; error.textContent=e.message||'环境检测失败'; list.appendChild(error)}}
+async function fillTrainConfigFromEnvironment(force=false,silent=false){try{let marked=false; try{marked=sessionStorage.getItem('environmentConfigAutoApplied')==='1'}catch(e){} const j=await api('/api/environment-config'); if(!force&&(marked||j.has_user_defaults)){try{sessionStorage.setItem('environmentConfigAutoApplied','1')}catch(e){} return false} apply(j.values||{}); await saveValues(); try{sessionStorage.setItem('environmentConfigAutoApplied','1')}catch(e){} if(!silent){const d=j.details||{}; const gpu=d.gpu_count?`${d.gpu_name||'GPU'}${d.gpu_total_gib?` · ${fmt(d.gpu_total_gib,1)} GB`:''}`:'CPU'; toast(`已按当前环境填入训练配置：${gpu}，${j.values?.train_device==='cuda'?'CUDA':'CPU'}，Batch ${j.values?.batch||'-'}`)} return true}catch(e){if(!silent) toast(`环境配置填入失败：${e.message}`); return false}}
+function closeEnvironment(){const dialog=document.getElementById('environment-dialog'); if(dialog) dialog.hidden=true; document.body.style.overflow=''}
 function updateSplitRatio(){const el=document.getElementById('train_ratio_percent'); const text=document.getElementById('split_ratio_text'); if(!el||!text) return; let train=Math.round(Number(el.value||80)); if(!Number.isFinite(train)) train=80; train=Math.max(1,Math.min(100,train)); if(String(train)!==el.value) el.value=String(train); text.textContent=`训练 ${train}% / 验证 ${100-train}%`}
 function fmt(v,d=3){return v===null||v===undefined||v===''||Number.isNaN(Number(v))?'-':Number(v).toFixed(d).replace(/\.0+$/,'').replace(/(\.\d*?)0+$/,'$1')}
 function setText(id,value){const el=document.getElementById(id); if(el) el.textContent=value}
 function drawChart(id,history,series){const canvas=document.getElementById(id); if(!canvas) return; const ctx=canvas.getContext('2d'); const w=canvas.width,h=canvas.height; ctx.clearRect(0,0,w,h); ctx.fillStyle='rgba(3,8,19,.72)'; ctx.fillRect(0,0,w,h); const rows=(history||[]).filter(x=>series.some(s=>x[s.key]!==null&&x[s.key]!==undefined)); ctx.strokeStyle='rgba(255,255,255,.09)'; ctx.lineWidth=1; for(let i=1;i<4;i++){const y=i*h/4; ctx.beginPath(); ctx.moveTo(34,y); ctx.lineTo(w-10,y); ctx.stroke()} if(rows.length<2){ctx.fillStyle='rgba(159,176,199,.9)'; ctx.font='13px sans-serif'; ctx.fillText('等待更多 epoch 数据...',18,34); return} let vals=[]; for(const r of rows){for(const s of series){const v=Number(r[s.key]); if(Number.isFinite(v)) vals.push(v)}} let min=Math.min(...vals),max=Math.max(...vals); if(min===max){min-=1;max+=1} const pad=(max-min)*0.08; min-=pad; max+=pad; const xOf=i=>34+i*(w-48)/Math.max(1,rows.length-1); const yOf=v=>h-22-(Number(v)-min)*(h-42)/(max-min); ctx.font='11px sans-serif'; series.forEach((s,si)=>{ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.beginPath(); let started=false; rows.forEach((r,i)=>{const v=Number(r[s.key]); if(!Number.isFinite(v)) return; const x=xOf(i),y=yOf(v); if(!started){ctx.moveTo(x,y); started=true}else ctx.lineTo(x,y)}); ctx.stroke(); ctx.fillStyle=s.color; ctx.fillText(s.label,38+si*82,16)}); ctx.fillStyle='rgba(159,176,199,.8)'; ctx.fillText(`E${rows[0].epoch}`,34,h-7); ctx.fillText(`E${rows[rows.length-1].epoch}`,w-52,h-7)}
 function updateTrainProgress(p){p=p||{}; const task=p.task||document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const pct=Math.max(0,Math.min(100,Number(p.percent||0))); const totalEpochs=Number(p.total_epochs||0); const epoch=Number(p.epoch||0); const totalBatches=Number(p.total_batches||0); const batch=Number(p.batch||0); const phaseMap={idle:'等待开始',pending:'准备训练',train:'训练中',val:'验证中',metrics:'指标已更新',export:'正在停止训练并导出'}; setText('train-phase',`${phaseMap[p.phase]||p.phase||'等待开始'}${p.updated_at?' · '+p.updated_at:''}`); const bar=document.getElementById('epoch-bar'); if(bar) bar.style.width=pct+'%'; setText('epoch-text',epoch&&totalEpochs?`${epoch}/${totalEpochs}`:'-'); setText('batch-text',totalBatches?`${batch}/${totalBatches} (${fmt(pct,1)}%)`:'-'); setText('gpu-text',p.gpu_mem||'-'); setText('speed-text',p.speed||'-'); setText('elapsed-text',p.elapsed||'-'); setText('eta-text',p.eta||'-'); const lossItem=document.getElementById('loss-item'); const boxItem=document.getElementById('box-loss-item'); const clsItem=document.getElementById('cls-loss-item'); const dflItem=document.getElementById('dfl-loss-item'); if(lossItem) lossItem.hidden=!classify; if(boxItem) boxItem.hidden=classify; if(clsItem) clsItem.hidden=classify; if(dflItem) dflItem.hidden=classify; setText('loss-title',classify?'分类训练损失':'检测训练损失'); setText('loss-value',fmt(p.loss)); setText('box-loss',fmt(p.box_loss)); setText('cls-loss',fmt(p.cls_loss)); setText('dfl-loss',fmt(p.dfl_loss)); const detectMetrics=document.getElementById('detect-metrics'); const classifyMetrics=document.getElementById('classify-metrics'); if(detectMetrics) detectMetrics.hidden=classify; if(classifyMetrics) classifyMetrics.hidden=!classify; const m=p.metrics||{}; setText('val-text',p.val_total?`${p.val_batch||0}/${p.val_total} (${fmt(p.val_percent||0,1)}%)`:'-'); setText('precision-text',fmt(m.precision)); setText('recall-text',fmt(m.recall)); setText('map50-text',fmt(m.map50)); setText('map5095-text',fmt(m.map50_95)); setText('top1-text',fmt(m.top1_acc)); setText('top5-text',fmt(m.top5_acc)); const lossSeries=classify?[{key:'loss',label:'loss',color:'#ffbd5a'}]:[{key:'box_loss',label:'box',color:'#56a8ff'},{key:'cls_loss',label:'cls',color:'#ffbd5a'},{key:'dfl_loss',label:'dfl',color:'#a78bfa'}]; const metricSeries=classify?[{key:'top1_acc',label:'Top-1',color:'#30d287'},{key:'top5_acc',label:'Top-5',color:'#56a8ff'}]:[{key:'precision',label:'P',color:'#30d287'},{key:'recall',label:'R',color:'#56a8ff'},{key:'map50',label:'mAP50',color:'#ffbd5a'},{key:'map50_95',label:'mAP50-95',color:'#a78bfa'}]; drawChart('loss-chart',p.history||[],lossSeries); drawChart('metric-chart',p.history||[],metricSeries)}
-function updateTrainTaskUI(){const task=document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const annotations=document.getElementById('annotations-field'); const hint=document.getElementById('train-task-hint'); if(annotations) annotations.hidden=task==='classify'; if(hint) hint.textContent=task==='classify'?'分类数据集结构：Images Dir/类别名/图片。每个类别至少 2 张图片；Annotations Dir 不参与分类训练；Base Model 请使用分类权重，例如 yolo11n-cls.pt。':'检测数据集结构：Images Dir 与 Annotations Dir 中的同名图片、XML 一一对应。'}
+function updateRknnProgress(p,markers){p=p||{}; markers=markers||{}; const mode=document.getElementById('rknn_mode')?.value||'both'; const sequences={fp:['check_environment','check_onnx','build_fp','package','complete'],int8:['check_environment','check_onnx','build_int8','package','complete'],both:['check_environment','check_onnx','build_fp','build_int8','package','complete']}; const sequence=sequences[mode]||sequences.both; const current=sequence.indexOf(p.stage); document.querySelectorAll('.rknn-stage').forEach(el=>{const index=sequence.indexOf(el.dataset.stage); el.classList.toggle('active',el.dataset.stage===p.stage); el.classList.toggle('done',index>=0&&current>=0&&index<current); el.classList.toggle('skipped',index<0)}); setText('rknn-progress-message',`${p.message||'等待开始'}${p.updated_at?' · '+p.updated_at:''}`); setText('rknn-progress-percent',`${Math.max(0,Math.min(100,Number(p.percent||0)))}%`); const artifactLabels={rknn_model_fp:'FP 模型',rknn_model_int8:'INT8 模型',rknn_package:'部署包',rknn_manifest:'清单'}; const list=document.getElementById('rknn-artifact-list'); const box=document.getElementById('rknn-artifacts'); const items=Object.entries(artifactLabels).filter(([key])=>markers[key]); if(list){list.innerHTML=''; items.forEach(([key,label])=>{const row=document.createElement('div'); row.className='rknn-artifact'; const name=document.createElement('span'); name.textContent=label; const path=document.createElement('b'); path.textContent=markers[key]; row.append(name,path); list.appendChild(row)})} if(box) box.hidden=!items.length; const download=document.getElementById('rknn-download-button'); if(download) download.disabled=!markers.rknn_package; if(p.error){showRknnCheck(p.partial_success?'error':'error',p.partial_success?`非量化模型可用，INT8 失败：${p.error}`:p.error)}}
+function updateTrainTaskUI(){const task=document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const annotations=document.getElementById('annotations-field'); const hint=document.getElementById('train-task-hint'); const splitMode=document.getElementById('split_mode'); const splitHint=document.getElementById('split-mode-hint'); if(annotations) annotations.hidden=classify; if(splitMode) splitMode.disabled=classify; if(splitHint) splitHint.textContent=classify?'分类任务按每个类别内部随机划分，此选项仅用于目标检测。':'视频分组会把“视频前缀_000015.jpg”末尾的帧号去掉，并保证同一视频只进入训练集或验证集；独立图片集才使用逐图片随机。'; if(hint) hint.textContent=classify?'分类数据集结构：Images Dir/类别名/图片。每个类别至少 2 张图片；Annotations Dir 不参与分类训练；Base Model 请使用分类权重，例如 yolo11n-cls.pt。':'检测数据集结构：Images Dir 与 Annotations Dir 中的同名图片、XML 一一对应。'}
+function updateRknnModeUI(){const mode=document.getElementById('rknn_mode')?.value||'both'; document.querySelectorAll('.rknn-calibration').forEach(el=>el.hidden=mode==='fp'); const count=Number(document.getElementById('rknn_calibration_count')?.value||0); setText('rknn-calibration-warning',mode!=='fp'&&count>0&&count<100?'少于 100 张可能增大量化精度损失。':'')}
 function syncLabelFields(prefix,toCanonical){const pairs=prefix==='camera'?[['label_name_camera','label_name'],['label_prefix_camera','label_prefix'],['label_images_dir_camera','label_images_dir'],['label_annotations_dir_camera','label_annotations_dir'],['label_tracker_camera','label_tracker'],['label_interval_camera','label_interval'],['label_max_frames_camera','label_max_frames'],['label_display_scale_camera','label_display_scale'],['label_jpeg_quality_camera','label_jpeg_quality']]:[['label_name_images','label_name'],['label_annotations_dir_images','label_annotations_dir'],['label_tracker_images','label_tracker'],['label_interval_images','label_interval'],['label_start_frame_images','label_start_frame'],['label_max_frames_images','label_max_frames'],['label_display_scale_images','label_display_scale']]; for(const [sourceId,canonicalId] of pairs){const from=document.getElementById(toCanonical?sourceId:canonicalId); const to=document.getElementById(toCanonical?canonicalId:sourceId); if(from&&to) to.value=from.value}}
 function updateLabelSourceUI(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; const video=document.getElementById('label-video-source'); const camera=document.getElementById('label-camera-source'); const images=document.getElementById('label-images-source'); const start=document.getElementById('label-start-button'); if(video) video.hidden=source!=='video'; if(camera) camera.hidden=source!=='camera'; if(images) images.hidden=source!=='images'; if(source==='camera') syncLabelFields('camera',false); if(source==='images') syncLabelFields('images',false); if(start) start.textContent=source==='camera'?'在网页中开始摄像头标注':source==='images'?'在网页中开始图片集标注':'在网页中开始视频标注'}
 function collect(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; if(source==='camera') syncLabelFields('camera',true); if(source==='images') syncLabelFields('images',true); for(const id of fields){const el=document.getElementById(id); if(el) values[id]=el.value} for(const n of ['train_device','train_task','test_source','label_source_type']){const el=document.querySelector(`input[name="${n}"]:checked`); if(el) values[n]=el.value} return values}
@@ -1981,7 +2462,7 @@ function resourceEstimateKey(v){return [v.train_task||'detect',v.train_images_di
 function showResourceEstimate(e){e=e||{}; setText('estimate-images',e.image_count!==undefined?`${e.image_count} 张`:'-'); setText('estimate-ram',e.ram_text||'-'); setText('estimate-vram',e.vram_text||'-'); setText('estimate-cache',e.cache_text||'-'); setText('estimate-imgsz',e.img_size||'-'); setText('estimate-batch',e.batch||'-'); const riskMap={safe:'资源预估',warning:'资源预估 · 警告',danger:'资源预估 · 风险'}; const model=e.model_size?` · YOLO-${e.model_size}`:''; setText('resource-note',`${riskMap[e.risk]||'资源预估'}${model} · cache=${e.cache_mode||'-'}`); setText('resource-detail',e.note||'估算值仅供参考，实际峰值会随模型、增强策略、驱动和环境波动。')}
 async function updateResourceEstimate(){try{const v=collect(); const key=resourceEstimateKey(v); if(key===lastResourceEstimateKey) return; lastResourceEstimateKey=key; setText('resource-note','正在估算...'); const j=await api('/api/train-estimate',{values:v}); showResourceEstimate(j.estimate||{})}catch(e){setText('resource-note','估算失败'); setText('resource-detail',e.message)}}
 function scheduleResourceEstimate(){clearTimeout(resourceEstimateTimer); resourceEstimateTimer=setTimeout(updateResourceEstimate,450)}
-function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); for(const n of ['train_device','train_task','test_source','label_source_type']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateLabelSourceUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
+function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); for(const n of ['train_device','train_task','test_source','label_source_type']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateRknnModeUI(); updateLabelSourceUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
 
 
 async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); const j=await r.json(); if(!r.ok||j.error) throw new Error(j.error||r.statusText); return j}
@@ -1989,7 +2470,7 @@ let valuesSaveQueue=Promise.resolve();
 function saveValues(){const snapshot={...collect()}; valuesSaveQueue=valuesSaveQueue.then(()=>api('/api/values',{values:snapshot})).catch(()=>{}); return valuesSaveQueue}
 async function saveDefaults(scope){const snapshot={...collect()}; try{await valuesSaveQueue; const j=await api('/api/defaults',{values:snapshot}); apply(j.values||{}); toast(`${scope||'当前配置'}已保存为默认`)}catch(e){toast(e.message)}}
 async function command(action){const j=await api('/api/command',{action,values:collect()}); return j.command}
-async function updateCommands(){try{document.getElementById('cmd-train').textContent=await command('train');document.getElementById('cmd-test').textContent=await command('test');document.getElementById('cmd-label').textContent=await command('label')}catch(e){}}
+async function updateCommands(){try{document.getElementById('cmd-train').textContent=await command('train');document.getElementById('cmd-test').textContent=await command('test');document.getElementById('cmd-rknn').textContent=await command('rknn_deploy');document.getElementById('cmd-label').textContent=await command('label')}catch(e){}}
 function setInputValue(id,value){const el=document.getElementById(id); if(el){el.value=value; values[id]=value}}
 function videoPrefix(video){return video.stem.replace(/[^\w\u4e00-\u9fa5-]+/g,'_').replace(/^_+|_+$/g,'')||'track'}
 function videoUrl(video,path='/api/video-file'){return `${path}?path=${encodeURIComponent(video.path)}&t=${Date.now()}`}
@@ -2004,6 +2485,15 @@ async function loadLabelVideos(){try{await saveValues(); const list=document.get
 async function pickTestImage(){try{const j=await api('/api/pick-test-image',{values:collect()}); if(j.path){setInputValue('test_image_file',j.path); await saveValues(); updateCommands()}else{toast('未选择图片')}}catch(e){toast(e.message)}}
 async function pickTestImageFolder(){try{const j=await api('/api/pick-test-image-folder',{values:collect()}); if(j.path){setInputValue('test_image_folder',j.path); await saveValues(); updateCommands()}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
 async function pickTestOutputDir(){try{const j=await api('/api/pick-test-output-dir',{values:collect()}); if(j.path){setInputValue('test_output_dir',j.path); await saveValues(); updateCommands()}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
+function showRknnCheck(kind,message){const box=document.getElementById('rknn-check-result'); if(!box) return; box.hidden=false; box.className=`rknn-check-result ${kind||''}`; box.textContent=message}
+async function pickRknnOnnx(){try{const j=await api('/api/pick-rknn-onnx',{values:collect()}); if(!j.path){toast('未选择模型');return} setInputValue('rknn_onnx',j.path); if(j.classes) setInputValue('rknn_classes',j.classes); await saveValues(); updateCommands()}catch(e){toast(e.message)}}
+async function pickRknnClasses(){try{const j=await api('/api/pick-rknn-classes',{values:collect()}); if(j.path){setInputValue('rknn_classes',j.path); await saveValues(); updateCommands()}else toast('未选择类别文件')}catch(e){toast(e.message)}}
+async function pickRknnCalibration(){try{const j=await api('/api/pick-rknn-calibration',{values:collect()}); if(j.path){setInputValue('rknn_calibration_dir',j.path); await saveValues(); updateCommands()}else toast('未选择校准目录')}catch(e){toast(e.message)}}
+async function pickRknnTestImage(){try{const j=await api('/api/pick-rknn-test-image',{values:collect()}); if(j.path){setInputValue('rknn_test_image',j.path); await saveValues(); updateCommands()}else toast('未选择测试图片')}catch(e){toast(e.message)}}
+async function pickRknnOutput(){try{const j=await api('/api/pick-rknn-output',{values:collect()}); if(j.path){setInputValue('rknn_output_dir',j.path); await saveValues(); updateCommands()}else toast('未选择输出目录')}catch(e){toast(e.message)}}
+async function checkRknnEnvironment(){const button=document.getElementById('rknn-env-button'); if(button) button.disabled=true; showRknnCheck('','正在使用所选 Python 检查 RKNN-Toolkit2...'); try{const j=await api('/api/rknn-check-environment',{values:collect()}); if(!j.ok){showRknnCheck('error',`${j.error||'RKNN 环境检查失败'} 请从板卡厂商获取配套 SDK，创建独立虚拟环境并安装厂商提供的 rknn_toolkit2 wheel。`);return} const i=j.info||{}; showRknnCheck('ok',`环境通过：Python ${i.python||'-'} · RKNN-Toolkit2 ${i.rknn_toolkit2||'-'} · ONNX ${i.onnx||'-'} · NumPy ${i.numpy||'-'}。请确认该 Toolkit 版本与板端 Runtime 匹配。`)}catch(e){showRknnCheck('error',e.message)}finally{if(button) button.disabled=false}}
+async function checkRknnModel(){const button=document.getElementById('rknn-model-button'); if(button) button.disabled=true; showRknnCheck('','正在读取 ONNX 结构...'); try{const j=await api('/api/rknn-check-model',{values:collect()}); if(j.classes){setInputValue('rknn_classes',j.classes); await saveValues()} if(!j.ok){showRknnCheck('error',j.error||'ONNX 模型检查失败');return} const i=j.info||{}; const outputs=(i.output_shapes||[]).map(shape=>`[${shape.map(v=>v??'?').join(', ')}]`).join(' / '); showRknnCheck('ok',`模型通过：输入 ${i.input_name||'-'} · ${i.input_width||'-'}×${i.input_height||'-'} · opset ${i.opset||'-'} · ${i.class_count||0} 类 · 输出 ${outputs||'-'}`); updateCommands()}catch(e){showRknnCheck('error',e.message)}finally{if(button) button.disabled=false}}
+function downloadRknnPackage(){const link=document.createElement('a'); link.href='/api/rknn-package'; link.download='rk3588_deploy.zip'; document.body.appendChild(link); link.click(); link.remove()}
 async function pickLabelVideoDir(){try{const j=await api('/api/pick-label-video-dir',{values:collect()}); if(j.path){setInputValue('label_video_dir',j.path); await saveValues(); await loadLabelVideos()}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
 async function pickLabelImagesDir(){try{const j=await api('/api/pick-label-images-dir',{values:collect()}); if(j.path){setInputValue('label_images_input_dir',j.path); await saveValues(); toast('已选择图片集文件夹')}else{toast('未选择文件夹')}}catch(e){toast(e.message)}}
 function selectNextVideo(){if(!labelVideos.length){toast('请先读取文件夹视频'); return} if(labelVideoIndex>=0&&labelVideos[labelVideoIndex]) labelVideos[labelVideoIndex].done=true; const next=Math.min(labelVideos.length-1,labelVideoIndex+1); selectLabelVideo(next); toast(next===labelVideos.length-1?'已到最后一个视频':'已切换到下一个视频')}
@@ -2046,7 +2536,7 @@ async function deleteBrowserLabelObject(){if(!labelSessionId||!labelActiveObject
 async function endBrowserLabelSession(){stopBrowserLabelPlay(); if(!labelSessionId){showLabelStudio(false);return} try{await api('/api/label-session/end',{session_id:labelSessionId})}catch(e){} labelSessionId='';labelSessionState=null;labelActiveObjectId=null;labelHiddenObjectIds.clear();sessionStorage.removeItem('labelSessionId');showLabelStudio(false);loadLabelResults()}
 async function runLabelCurrent(){await startBrowserLabelSession()}
 async function copyCommand(action){try{const cmd=await command(action); await navigator.clipboard.writeText(cmd); toast('命令已复制')}catch(e){toast(e.message)}}
-async function runAction(action){try{await api('/api/run',{action,values:collect()}); showTab('logs'); toast('任务已启动'); refreshState()}catch(e){toast(e.message)}}
+async function runAction(action){try{await api('/api/run',{action,values:collect()}); showTab(action==='rknn_deploy'?'rknn':'logs'); toast('任务已启动'); refreshState()}catch(e){toast(e.message)}}
 function updateJobInputMode(){const input=document.getElementById('job-input'); const secret=document.getElementById('job-input-secret'); if(input&&secret) input.type=secret.checked?'password':'text'}
 async function stopJob(){try{const j=await api('/api/stop',{}); toast(j.stopped?'已请求停止':'当前没有正在运行的任务'); refreshState()}catch(e){toast(e.message)}}
 function openImageLightbox(src,title){const box=document.getElementById('image-lightbox'); const image=document.getElementById('image-lightbox-image'); const caption=document.getElementById('image-lightbox-title'); if(!box||!image||!caption) return; image.src=src; image.alt=title; caption.textContent=title; box.hidden=false; document.body.style.overflow='hidden'; document.getElementById('image-lightbox-close')?.focus()}
@@ -2054,19 +2544,35 @@ function closeImageLightbox(){const box=document.getElementById('image-lightbox'
 async function loadLabelResults(){try{await saveValues(); const r=await fetch('/api/label-results'); const j=await r.json(); const box=document.getElementById('label-results'); box.innerHTML=''; const items=j.items||[]; if(!items.length){box.innerHTML='<div class="empty">当前图片目录和标注目录中还没有可显示的标注结果。</div>'; return} for(const it of items){const card=document.createElement('div'); card.className='sample'; const src='/api/label-preview?image='+encodeURIComponent(it.image)+'&xml='+encodeURIComponent(it.xml)+'&t='+Date.now(); const title=`${it.stem} · ${(it.boxes||[]).length} 个框`; card.innerHTML=`<button class="preview-trigger" type="button" aria-label="放大查看 ${title}"><img src="${src}" loading="lazy" alt="${title}"></button><div class="meta"><b>${it.stem}</b><span>${(it.boxes||[]).length} 个框</span><button class="delete">删除标注</button></div>`; card.querySelector('.preview-trigger').onclick=()=>openImageLightbox(src,title); card.querySelector('.delete').onclick=async()=>{const imageMode=collect().label_source_type==='images'; const target=imageMode?'对应 XML 标注':'这张图片和对应 XML'; if(Date.now()>deleteConfirmUntil){if(!confirm(`确定删除${target}吗？\n确认后 5 分钟内删除标注不再重复询问。`)) return; deleteConfirmUntil=Date.now()+5*60*1000} await api('/api/delete-label-sample',{image:it.image,xml:it.xml}); card.remove(); toast(imageMode?'已删除 XML 标注':'已删除废图和 XML')}; box.appendChild(card)}}catch(e){toast(e.message)}}
 async function loadTrainPlots(){try{const r=await fetch('/api/train-plots'); const j=await r.json(); const box=document.getElementById('train-plots'); if(!box) return; const note=document.getElementById('train-plots-note'); const items=j.items||[]; if(note) note.textContent=items.length?`已发现 ${items.length} 张图片`:'训练开始后自动刷新'; if(!items.length){box.innerHTML='<div class="empty">训练进行中或尚未生成可视化图。</div>'; return} box.innerHTML=''; for(const item of items){const card=document.createElement('div'); card.className='sample'; card.innerHTML=`<img src="/api/train-plot?name=${encodeURIComponent(item.name)}&t=${Date.now()}" loading="lazy"><div class="meta"><b>${item.name}</b></div>`; box.appendChild(card)}}catch(e){}}
 function scheduleLabelResultsRefresh(){clearTimeout(labelResultsTimer); labelResultsTimer=setTimeout(()=>loadLabelResults(),350)}
-async function refreshState(){const r=await fetch('/api/state'); const s=await r.json(); apply(s.values||{}); updateTrainProgress(s.train_progress||{}); const log=document.getElementById('log'); log.textContent=(s.logs||[]).join(''); log.scrollTop=log.scrollHeight; const pill=document.getElementById('runPill'); pill.className='pill '+(s.running?'run':'idle'); pill.querySelector('span:last-child').textContent=s.running?'运行中':'空闲'; document.getElementById('jobInfo').textContent=s.job?`${s.job} | 开始: ${s.started_at||'-'} | 结束: ${s.finished_at||'-'} | 退出码: ${s.exit_code??'-'}`:'暂无任务'; const box=document.getElementById('markers'); box.innerHTML=''; for(const [k,v] of Object.entries(s.markers||{})){const div=document.createElement('div'); div.className='marker'; div.innerHTML=`<b>${k}</b><span>${v}</span>`; box.appendChild(div)}}
-function copyLogs(){navigator.clipboard.writeText(document.getElementById('log').textContent);toast('日志已复制')}
-function showTab(name){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+name).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.tab===name)); if(name==='label') loadLabelResults()}
+function logLines(text){if(!text) return []; const lines=text.replace(/\r\n?/g,'\n').split('\n'); if(lines.at(-1)==='') lines.pop(); return lines}
+function setLogFollow(enabled){const follow=document.getElementById('log-follow'); if(follow) follow.checked=enabled; setText('log-follow-status',enabled?'正在跟随最新日志':'已暂停跟随，可自由查看历史日志'); if(enabled) scrollLogToEnd()}
+function scrollLogToEnd(){const log=document.getElementById('log'); if(!log) return; logAutoScrolling=true; log.scrollTop=log.scrollHeight; requestAnimationFrame(()=>{logAutoScrolling=false})}
+function renderLogs(forceFollow=false){const log=document.getElementById('log'); if(!log) return; const search=(document.getElementById('log-search')?.value||'').trim().toLocaleLowerCase(); const level=document.getElementById('log-level')?.value||'all'; const allLines=logLines(rawLogText); const filtered=allLines.filter(line=>{if(level==='error'&&!LOG_ERROR_PATTERN.test(line)) return false; if(level==='warning'&&!LOG_WARNING_PATTERN.test(line)) return false; return !search||line.toLocaleLowerCase().includes(search)}); visibleLogText=filtered.join('\n'); log.textContent=visibleLogText||(rawLogText?'没有符合当前条件的日志。':'任务开始后将在这里显示实时日志。'); setText('log-count',search||level!=='all'?`显示 ${filtered.length} / ${allLines.length} 行`:`${allLines.length} 行`); const follow=document.getElementById('log-follow')?.checked!==false; setText('log-follow-status',follow?'正在跟随最新日志':'已暂停跟随，可自由查看历史日志'); if(follow||forceFollow) scrollLogToEnd()}
+function updateLogState(s,forceFollow=false){const next=(s.logs||[]).join(''); const changed=next!==rawLogText; rawLogText=next; currentLogJob=s.job||''; const stopButton=document.getElementById('stop-job-button'); if(stopButton) stopButton.disabled=!s.running; const alert=document.getElementById('log-alert'); if(alert){const stopped=rawLogText.includes('[stopped'); const failedCode=!s.running&&s.exit_code!==null&&Number(s.exit_code)!==0; const message=s.last_error?`任务执行失败：${s.last_error}`:failedCode?(stopped?`任务已停止，退出码 ${s.exit_code}`:`任务异常结束，退出码 ${s.exit_code}`):''; alert.textContent=message; alert.classList.toggle('warn',Boolean(message&&stopped&&!s.last_error)); alert.hidden=!message} if(!logInitialized||changed||forceFollow){logInitialized=true;renderLogs(forceFollow)}}
+async function refreshState(forceLogFollow=false){const r=await fetch('/api/state'); const s=await r.json(); apply(s.values||{}); updateTrainProgress(s.train_progress||{}); updateRknnProgress(s.rknn_progress||{},s.markers||{}); updateLogState(s,forceLogFollow); const pill=document.getElementById('runPill'); pill.className='pill '+(s.running?'run':'idle'); pill.querySelector('span:last-child').textContent=s.running?'运行中':'空闲'; document.getElementById('jobInfo').textContent=s.job?`${s.job} | 开始: ${s.started_at||'-'} | 结束: ${s.finished_at||'-'} | 退出码: ${s.exit_code??'-'}`:'暂无任务'; const start=document.getElementById('rknn-start-button'); if(start) start.disabled=Boolean(s.running); const box=document.getElementById('markers'); box.innerHTML=''; for(const [k,v] of Object.entries(s.markers||{})){const div=document.createElement('div'); div.className='marker'; const name=document.createElement('b'); name.textContent=k; const value=document.createElement('span'); value.textContent=v; div.append(name,value); box.appendChild(div)}}
+async function copyLogs(){if(!visibleLogText){toast('当前没有可复制的日志');return} try{await navigator.clipboard.writeText(visibleLogText);toast('当前日志视图已复制')}catch(e){toast(`复制失败：${e.message}`)}}
+function downloadLogs(){if(!rawLogText){toast('当前没有可下载的日志');return} const stamp=new Date().toISOString().replace(/[:.]/g,'-'); const blob=new Blob([rawLogText],{type:'text/plain;charset=utf-8'}); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download=`${currentLogJob||'model-training-tool'}-${stamp}.log`; document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),0); toast('完整日志已下载')}
+function showTab(name){const target=document.getElementById('tab-'+name); if(!target) return; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));target.classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.tab===name)); if(location.hash!==`#${name}`) history.replaceState(null,'',`#${name}`); if(name==='label') loadLabelResults()}
 
 function installLabelCanvasInputGuard(){const canvas=document.getElementById('label-frame-canvas'); const image=document.getElementById('label-frame-image'); if(canvas&&!canvas.dataset.inputGuard){canvas.dataset.inputGuard='1'; const prevent=event=>event.preventDefault(); canvas.addEventListener('pointerdown',prevent,{capture:true}); canvas.addEventListener('pointermove',prevent,{capture:true}); canvas.addEventListener('pointerup',prevent,{capture:true}); canvas.addEventListener('pointercancel',event=>{event.preventDefault(); labelDragStart=null; drawLabelCanvas()},{capture:true}); canvas.addEventListener('lostpointercapture',()=>{labelDragStart=null; drawLabelCanvas()}); canvas.addEventListener('dragstart',prevent)} if(image) image.addEventListener('dragstart',event=>event.preventDefault())}
 installLabelCanvasInputGuard();
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+if(document.getElementById('tab-'+location.hash.slice(1))) showTab(location.hash.slice(1));
+window.addEventListener('hashchange',()=>{const name=location.hash.slice(1); if(document.getElementById('tab-'+name)) showTab(name)});
+document.getElementById('environment-button')?.addEventListener('click',checkEnvironment);
+document.getElementById('environment-fill-button')?.addEventListener('click',()=>fillTrainConfigFromEnvironment(true));
+document.getElementById('environment-close')?.addEventListener('click',closeEnvironment);
+document.getElementById('environment-dialog')?.addEventListener('click',event=>{if(event.target===event.currentTarget) closeEnvironment()});
 document.getElementById('image-lightbox-close')?.addEventListener('click',closeImageLightbox);
 document.getElementById('image-lightbox')?.addEventListener('click',event=>{if(event.target===event.currentTarget) closeImageLightbox()});
-document.addEventListener('keydown',event=>{if(event.key==='Escape') closeImageLightbox()});
-document.querySelectorAll('input,select').forEach(el=>{const handler=()=>{if(el.id==='label_prefix') rawLabelPrefix.manual=true; if(el.name==='train_task') updateTrainTaskUI(); if(el.name==='label_source_type') updateLabelSourceUI(); collect(); updateCurrentVideo(); saveValues(); updateCommands(); if(['train_images_dir','base_model','img_width','img_height','image_resize_mode','batch','train_cache'].includes(el.id)||el.name==='train_device'||el.name==='train_task') scheduleResourceEstimate(); if(['label_images_dir','label_annotations_dir','label_annotations_dir_images','label_images_input_dir'].includes(el.id)) scheduleLabelResultsRefresh()}; el.addEventListener('input',handler); el.addEventListener('change',handler)});
+document.addEventListener('keydown',event=>{if(event.key==='Escape'){closeImageLightbox(); closeEnvironment()}});
+document.getElementById('log-search')?.addEventListener('input',()=>renderLogs());
+document.getElementById('log-level')?.addEventListener('change',()=>renderLogs());
+document.getElementById('log-follow')?.addEventListener('change',event=>setLogFollow(event.currentTarget.checked));
+document.getElementById('log')?.addEventListener('scroll',event=>{const log=event.currentTarget; if(!logAutoScrolling&&log.scrollHeight-log.scrollTop-log.clientHeight>36) setLogFollow(false)});
+document.querySelectorAll('input:not([data-local-control]),select:not([data-local-control])').forEach(el=>{const handler=()=>{if(el.id==='label_prefix') rawLabelPrefix.manual=true; if(el.name==='train_task') updateTrainTaskUI(); if(el.name==='label_source_type') updateLabelSourceUI(); if(el.id==='rknn_mode'||el.id==='rknn_calibration_count') updateRknnModeUI(); collect(); updateCurrentVideo(); saveValues(); updateCommands(); if(['train_images_dir','base_model','img_width','img_height','image_resize_mode','batch','train_cache'].includes(el.id)||el.name==='train_device'||el.name==='train_task') scheduleResourceEstimate(); if(['label_images_dir','label_annotations_dir','label_annotations_dir_images','label_images_input_dir'].includes(el.id)) scheduleLabelResultsRefresh()}; el.addEventListener('input',handler); el.addEventListener('change',handler)});
 updateSplitRatio();
-refreshState(); setInterval(refreshState,1400);
+refreshState().then(()=>fillTrainConfigFromEnvironment(false)); setInterval(refreshState,1400);
 
 
 
@@ -2113,6 +2619,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "logs": STATE["logs"],
                     "markers": STATE["markers"],
                     "train_progress": STATE["train_progress"],
+                    "rknn_progress": STATE["rknn_progress"],
                     "running": STATE["running"],
                     "job": STATE["job"],
                     "exit_code": STATE["exit_code"],
@@ -2120,6 +2627,18 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "finished_at": STATE["finished_at"],
                     "last_error": STATE["last_error"],
                 })
+            return
+        if parsed.path == "/api/rknn-package":
+            try:
+                send_rknn_package(self)
+            except Exception as exc:
+                message = str(exc).encode("utf-8", errors="replace")
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
             return
         if parsed.path == "/api/train-plots":
             _, items = list_train_plots()
@@ -2263,6 +2782,22 @@ class PanelHandler(BaseHTTPRequestHandler):
                 values = clean_values(body.get("values"))
                 self.send_json({"estimate": estimate_train_resources(values)})
                 return
+            if self.path == "/api/environment":
+                self.send_json(detect_environment())
+                return
+            if self.path == "/api/environment-config":
+                recommendation = recommend_train_config()
+                recommendation["has_user_defaults"] = USER_DEFAULTS_FILE.is_file()
+                self.send_json(recommendation)
+                return
+            if self.path == "/api/rknn-check-environment":
+                values = clean_values(body.get("values"))
+                self.send_json(run_rknn_check(values, environment_only=True))
+                return
+            if self.path == "/api/rknn-check-model":
+                values = clean_values(body.get("values"))
+                self.send_json(run_rknn_check(values, environment_only=False))
+                return
             if self.path == "/api/values":
 
                 values = clean_values(body.get("values"))
@@ -2279,6 +2814,33 @@ class PanelHandler(BaseHTTPRequestHandler):
             if self.path == "/api/pick-test-image":
                 values = clean_values(body.get("values"))
                 self.send_json({"path": pick_image_file(values.get("test_image_file", ""))})
+                return
+            if self.path == "/api/pick-rknn-onnx":
+                values = clean_values(body.get("values"))
+                selected = pick_file(values.get("rknn_onnx", ""), "选择 ONNX 模型", [("ONNX 模型", "*.onnx"), ("所有文件", "*.*")])
+                classes = values.get("rknn_classes", "")
+                if selected and not classes.strip():
+                    candidate = Path(selected).parent / "classes.txt"
+                    if candidate.is_file():
+                        classes = str(candidate)
+                self.send_json({"path": selected, "classes": classes})
+                return
+            if self.path == "/api/pick-rknn-classes":
+                values = clean_values(body.get("values"))
+                selected = pick_file(values.get("rknn_classes", ""), "选择类别文件", [("文本文件", "*.txt"), ("所有文件", "*.*")])
+                self.send_json({"path": selected})
+                return
+            if self.path == "/api/pick-rknn-calibration":
+                values = clean_values(body.get("values"))
+                self.send_json({"path": pick_directory(values.get("rknn_calibration_dir", ""), "选择 INT8 校准图片目录")})
+                return
+            if self.path == "/api/pick-rknn-test-image":
+                values = clean_values(body.get("values"))
+                self.send_json({"path": pick_image_file(values.get("rknn_test_image", ""))})
+                return
+            if self.path == "/api/pick-rknn-output":
+                values = clean_values(body.get("values"))
+                self.send_json({"path": pick_directory(values.get("rknn_output_dir", ""), "选择 RKNN 输出目录")})
                 return
             if self.path == "/api/pick-test-image-folder":
                 values = clean_values(body.get("values"))
