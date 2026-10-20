@@ -26,11 +26,26 @@ def prediction_summary(result) -> tuple[str, float]:
     return label, confidence
 
 
+def print_keypoints(result, image_path: Path) -> None:
+    keypoints = getattr(result, "keypoints", None)
+    if keypoints is None or keypoints.xy is None:
+        return
+    xy = keypoints.xy.cpu().numpy()
+    visibility = keypoints.conf.cpu().numpy() if keypoints.conf is not None else None
+    for index, points in enumerate(xy):
+        items = []
+        for kpt_index, (x, y) in enumerate(points.tolist()):
+            v = float(visibility[index][kpt_index]) if visibility is not None else 1.0
+            items.append(f"{kpt_index}:{x:.1f},{y:.1f},{v:.2f}")
+        print(f"TEST_KEYPOINTS image={image_path.name} object={index} " + " ".join(items), flush=True)
+
+
 def predict_image(model: YOLO, image_path: Path, conf: float):
     frame = cv2.imread(str(image_path))
     if frame is None:
         raise ValueError(f"图片无法读取：{image_path}")
     results = model.predict(frame, conf=conf, verbose=False)
+    print_keypoints(results[0], image_path)
     return draw_results(results), prediction_summary(results[0])
 
 
@@ -88,8 +103,10 @@ def open_camera(camera_index: int):
         if not cap.isOpened():
             cap.release()
             continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # 与训练视频一致：1280x720，MJPG 才能在 USB2.0 下跑满 720p
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         for _ in range(10):
             ok, frame = cap.read()
             if ok and frame is not None:
@@ -108,8 +125,11 @@ def run_camera(model: YOLO, camera_index: int, conf: float):
             "or try --camera-index 1/2."
         )
 
-    print(f"Camera opened with {backend_name}. Press q or ESC to quit.", flush=True)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Camera opened with {backend_name} at {width}x{height}. Press q or ESC to quit.", flush=True)
     cv2.namedWindow("YOLO Camera Test", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("YOLO Camera Test", 1920, 1080)
     while True:
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -126,7 +146,7 @@ def run_camera(model: YOLO, camera_index: int, conf: float):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="测试 Ultralytics 检测或分类 .pt 模型")
+    ap = argparse.ArgumentParser(description="测试 Ultralytics 检测、分类或关键点姿态 .pt 模型")
     ap.add_argument("--model", required=True)
     ap.add_argument("--source", choices=["camera", "image", "folder"], required=True)
     ap.add_argument("--image", default="")

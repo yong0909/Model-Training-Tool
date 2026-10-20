@@ -89,7 +89,28 @@ def shape_text(shape: list[Optional[int]]) -> str:
     return ",".join(str(value) if value is not None else "?" for value in shape)
 
 
-def inspect_onnx(onnx_path: Path, classes_path: Path) -> dict[str, Any]:
+def onnx_pose_metadata(model: Any) -> tuple[str, int]:
+    """Read task / kpt_shape that Ultralytics writes into ONNX metadata_props."""
+    props = {item.key: item.value for item in model.metadata_props}
+    task = str(props.get("task") or "").strip()
+    kpt_count = 0
+    raw = props.get("kpt_shape")
+    if raw:
+        try:
+            import ast
+
+            shape = ast.literal_eval(raw)
+            if shape and int(shape[1]) != 3:
+                raise DeployError("onnx", f"板端示例仅支持 kpt_shape=[k, 3]，当前为 {raw}。")
+            kpt_count = int(shape[0])
+        except DeployError:
+            raise
+        except Exception:
+            kpt_count = 0
+    return task, kpt_count
+
+
+def inspect_onnx(onnx_path: Path, classes_path: Path, kpt_count_override: int = 0) -> dict[str, Any]:
     stage("check_onnx")
     if not onnx_path.is_file():
         raise DeployError("onnx", f"ONNX 模型不存在：{onnx_path}")
@@ -139,8 +160,25 @@ def inspect_onnx(onnx_path: Path, classes_path: Path) -> dict[str, Any]:
         output_shapes.append([onnx_dimension(dim) for dim in output.type.tensor_type.shape.dim])
     if not output_shapes:
         raise DeployError("onnx", "ONNX 模型没有输出张量。")
-    expected_channels = {len(classes) + 4, len(classes) + 5}
+    task, kpt_count = onnx_pose_metadata(model)
+    if kpt_count_override > 0:
+        kpt_count = kpt_count_override
+        task = "pose"
+    if task == "pose" and kpt_count <= 0:
+        raise DeployError("onnx", "姿态模型缺少 kpt_shape 元数据，请使用 --kpt-count 指定关键点数量。")
+    task = "pose" if task == "pose" else "detect"
+    if task == "pose":
+        expected_channels = {len(classes) + 4 + kpt_count * 3}
+    else:
+        expected_channels = {len(classes) + 4, len(classes) + 5}
     fixed_output_dims = {value for shape in output_shapes for value in shape if value is not None}
+    if not expected_channels.intersection(fixed_output_dims) and task == "pose":
+        expected = next(iter(expected_channels))
+        raise DeployError(
+            "onnx",
+            f"姿态输出形状与 {len(classes)} 个类别、{kpt_count} 个关键点不匹配：未找到通道维度 "
+            f"4+{len(classes)}+{kpt_count}*3={expected}。请导出不含 NMS 的原始输出（推荐 yolov8n-pose/yolo11n-pose）。",
+        )
     if not expected_channels.intersection(fixed_output_dims):
         expected = " 或 ".join(str(value) for value in sorted(expected_channels))
         raise DeployError(
@@ -165,7 +203,12 @@ def inspect_onnx(onnx_path: Path, classes_path: Path) -> dict[str, Any]:
         "input_height": height,
         "output_names": [item.name for item in model.graph.output],
         "output_shapes": output_shapes,
+        "task": task,
+        "kpt_count": kpt_count,
     }
+    emit("RKNN_TASK", task)
+    if task == "pose":
+        emit("RKNN_KPT_COUNT", kpt_count)
     emit("RKNN_INPUT_NAME", input_value.name)
     emit("RKNN_INPUT_SIZE", f"{width}x{height}")
     for output_shape in output_shapes:
@@ -331,9 +374,9 @@ def nms(boxes, scores, threshold):
     return keep
 
 
-def detection_rows(outputs, class_count):
+def detection_rows(outputs, class_count, kpt_count=0):
     rows = []
-    expected = {class_count + 4, class_count + 5}
+    expected = {class_count + 4 + kpt_count * 3} if kpt_count else {class_count + 4, class_count + 5}
     for output in outputs:
         array = np.asarray(output).squeeze()
         if array.ndim != 2:
@@ -348,19 +391,21 @@ def detection_rows(outputs, class_count):
     return np.concatenate(rows, axis=0)
 
 
-def decode(outputs, class_count, confidence, iou_threshold):
-    predictions = detection_rows(outputs, class_count)
+def decode(outputs, class_count, confidence, iou_threshold, kpt_count=0):
+    predictions = detection_rows(outputs, class_count, kpt_count)
     boxes_xywh = predictions[:, :4].astype(np.float32)
-    if predictions.shape[1] == class_count + 5:
+    # Pose rows: cx cy w h, class scores, then k*(x, y, visibility) in input pixels.
+    keypoints = predictions[:, 4 + class_count:].reshape(len(predictions), kpt_count, 3) if kpt_count else np.empty((len(predictions), 0, 3))
+    if not kpt_count and predictions.shape[1] == class_count + 5:
         class_scores = predictions[:, 5:] * predictions[:, 4:5]
     else:
-        class_scores = predictions[:, 4:]
+        class_scores = predictions[:, 4:4 + class_count]
     class_ids = class_scores.argmax(axis=1)
     scores = class_scores[np.arange(len(class_scores)), class_ids]
     valid = scores >= confidence
-    boxes_xywh, scores, class_ids = boxes_xywh[valid], scores[valid], class_ids[valid]
+    boxes_xywh, scores, class_ids, keypoints = boxes_xywh[valid], scores[valid], class_ids[valid], keypoints[valid]
     if not len(scores):
-        return np.empty((0, 4)), scores, class_ids
+        return np.empty((0, 4)), scores, class_ids, keypoints
     boxes = np.empty_like(boxes_xywh)
     boxes[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
     boxes[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
@@ -371,21 +416,23 @@ def decode(outputs, class_count, confidence, iou_threshold):
         indices = np.where(class_ids == class_id)[0]
         selected.extend(indices[nms(boxes[indices], scores[indices], iou_threshold)])
     selected = np.asarray(selected, dtype=np.int64)
-    return boxes[selected], scores[selected], class_ids[selected]
+    return boxes[selected], scores[selected], class_ids[selected], keypoints[selected]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RK3588 RKNN 单图片目标检测")
+    parser = argparse.ArgumentParser(description="RK3588 RKNN 单图片目标检测 / 关键点姿态")
     parser.add_argument("--model", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", default="result.jpg")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--kpt-conf", type=float, default=0.5, help="关键点可见性阈值")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
     manifest = __import__("json").loads((root / "deployment_manifest.json").read_text(encoding="utf-8"))
     classes = manifest["classes"]
+    kpt_count = int(manifest.get("kpt_count") or 0) if manifest.get("task") == "pose" else 0
     width, height = manifest["input"]["width"], manifest["input"]["height"]
     image = cv2.imread(args.image)
     if image is None:
@@ -403,17 +450,29 @@ def main():
     finally:
         rknn.release()
 
-    boxes, scores, class_ids = decode(outputs, len(classes), args.conf, args.iou)
+    boxes, scores, class_ids, keypoints = decode(outputs, len(classes), args.conf, args.iou, kpt_count)
+    if len(keypoints):
+        keypoints[..., 0] = (keypoints[..., 0] - pad_x) / ratio
+        keypoints[..., 1] = (keypoints[..., 1] - pad_y) / ratio
     if len(boxes):
         boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / ratio
         boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / ratio
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, image.shape[1] - 1)
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, image.shape[0] - 1)
-    for box, score, class_id in zip(boxes.astype(int), scores, class_ids):
+    for index, (box, score, class_id) in enumerate(zip(boxes.astype(int), scores, class_ids)):
         x1, y1, x2, y2 = box.tolist()
         cv2.rectangle(image, (x1, y1), (x2, y2), (32, 220, 120), 2)
         cv2.putText(image, f"{classes[int(class_id)]} {score:.2f}", (x1, max(18, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (32, 220, 120), 2, cv2.LINE_AA)
+        if kpt_count:
+            points = []
+            for kpt_index, (kx, ky, kv) in enumerate(keypoints[index].tolist()):
+                points.append(f"{kpt_index}:{kx:.1f},{ky:.1f},{kv:.2f}")
+                if kv >= args.kpt_conf:
+                    cv2.circle(image, (int(round(kx)), int(round(ky))), 4, (0, 80, 255), -1)
+                    cv2.putText(image, str(kpt_index), (int(kx) + 5, int(ky) - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 80, 255), 1, cv2.LINE_AA)
+            print(f"object={index} class={classes[int(class_id)]} score={score:.3f} keypoints=" + " ".join(points))
     if not cv2.imwrite(args.output, image):
         raise SystemExit(f"结果图片保存失败：{args.output}")
     print(f"detections={len(boxes)}")
@@ -446,7 +505,9 @@ python3 infer_image.py --model models/model_fp.rknn --image test.jpg --output re
 板端示例执行 letterbox、BGR 转 RGB；归一化由模型中的 mean/std 配置完成，
 请勿在输入侧再次除以 255。
 
-第一版仅支持 Ultralytics YOLO 目标检测的单个原始预测输出。
+支持 Ultralytics YOLO 目标检测与关键点姿态（pose）的单个原始预测输出。
+姿态模型会额外打印每个目标的关键点像素坐标与可见性（`--kpt-conf` 控制绘制阈值）；
+关键点精度对量化敏感，建议优先使用 FP 模型。
 '''
 
 
@@ -494,6 +555,9 @@ def create_package(
         ],
         "classes": metadata["classes"],
         "class_count": metadata["class_count"],
+        "task": metadata.get("task", "detect"),
+        "kpt_count": metadata.get("kpt_count", 0),
+        "kpt_shape": [metadata.get("kpt_count", 0), 3] if metadata.get("task") == "pose" else None,
         "rknn_toolkit2": environment["rknn_toolkit2"],
         "conversion_mode": mode,
         "calibration_image_count": calibration_count,
@@ -533,7 +597,7 @@ def create_package(
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="将 Ultralytics YOLO ONNX 转换为 RK3588 RKNN 并生成部署包")
-    parser.add_argument("--onnx", help="静态 Ultralytics YOLO 目标检测 ONNX")
+    parser.add_argument("--onnx", help="静态 Ultralytics YOLO 目标检测或姿态 ONNX")
     parser.add_argument("--classes", help="类别文件，每行一个类别")
     parser.add_argument("--output-dir", help="输出目录；留空时在 ONNX 同目录创建时间戳目录")
     parser.add_argument("--mode", choices=("fp", "int8", "both"), default="both")
@@ -542,6 +606,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--test-image", help="可选的转换后模拟推理图片")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--kpt-count", type=int, default=0, help="姿态模型关键点数；0 表示从 ONNX 元数据自动读取")
     parser.add_argument("--check-environment", action="store_true", help="只检查当前 RKNN Python 环境")
     parser.add_argument("--check-only", action="store_true", help="只检查 ONNX 和类别文件")
     return parser.parse_args(argv)
@@ -578,7 +643,7 @@ def run(args: argparse.Namespace) -> None:
     onnx_path = Path(args.onnx).expanduser().resolve()
     classes_path = Path(args.classes).expanduser().resolve()
     if args.check_only:
-        metadata = inspect_onnx(onnx_path, classes_path)
+        metadata = inspect_onnx(onnx_path, classes_path, args.kpt_count)
         emit("RKNN_MODEL_INFO_JSON", json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
         print("ONNX 模型检查通过。", flush=True)
         return
@@ -586,7 +651,7 @@ def run(args: argparse.Namespace) -> None:
     stage("check_environment")
     environment = environment_info(require_toolkit=True)
     emit("RKNN_ENVIRONMENT_JSON", json.dumps(environment, ensure_ascii=False, separators=(",", ":")))
-    metadata = inspect_onnx(onnx_path, classes_path)
+    metadata = inspect_onnx(onnx_path, classes_path, args.kpt_count)
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
