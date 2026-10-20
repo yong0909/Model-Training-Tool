@@ -3,7 +3,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -11,6 +11,8 @@ import cv2
 
 
 BBox = Tuple[int, int, int, int]
+# Pose keypoint in source pixels: [x, y, v], v: 0 absent, 1 occluded, 2 visible.
+Keypoint = list
 
 
 @dataclass
@@ -21,6 +23,8 @@ class TrackObject:
     tracker: object
     ok: bool = True
     sample_count: int = 1
+    keypoints: list = field(default_factory=list)
+    bbox_auto: bool = False
 
 
 class TemplateTracker:
@@ -182,6 +186,117 @@ def parse_labels(raw: str) -> list[str]:
     return labels or ["object"]
 
 
+DEFAULT_SAFE_ZONE_KPT_NAMES = ("entry_left", "entry_right", "inner_right", "inner_left", "divider_entry", "divider_inner")
+
+
+def parse_kpt_names(raw: str, kpt_count: int) -> list[str]:
+    names = [part.strip() for part in re.split(r"[,;\n]+", raw or "") if part.strip()]
+    return names or [f"kpt{index}" for index in range(kpt_count)]
+
+
+def bbox_from_keypoints(points: Sequence[Keypoint], width: int, height: int, margin: float = 0.08) -> BBox:
+    """Derive an object box from labeled keypoints with a small margin (min 8 px)."""
+    xs = [x for x, _, v in points if v > 0]
+    ys = [y for _, y, v in points if v > 0]
+    x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+    pad_x = max(8.0, (x2 - x1) * margin)
+    pad_y = max(8.0, (y2 - y1) * margin)
+    x1, y1 = max(0.0, x1 - pad_x), max(0.0, y1 - pad_y)
+    x2, y2 = min(width - 1.0, x2 + pad_x), min(height - 1.0, y2 + pad_y)
+    return sanitize_bbox((x1, y1, max(3.0, x2 - x1), max(3.0, y2 - y1)), width, height)
+
+
+def follow_keypoints(points: Sequence[Keypoint], old_bbox: BBox, new_bbox: BBox) -> list[Keypoint]:
+    """Move keypoints with the tracked box (scale + translate). Approximate; press k to re-label."""
+    ox, oy, ow, oh = old_bbox
+    nx, ny, nw, nh = new_bbox
+    sx, sy = nw / max(1, ow), nh / max(1, oh)
+    return [[nx + (x - ox) * sx, ny + (y - oy) * sy, v] if v > 0 else [x, y, v] for x, y, v in points]
+
+
+def kpt_color(index: int):
+    palette = [(90, 90, 255), (71, 179, 255), (90, 227, 255), (140, 255, 90), (255, 210, 90), (255, 123, 176), (213, 123, 255), (255, 255, 255)]
+    return palette[index % len(palette)]
+
+
+def draw_keypoints(view, points: Sequence[Keypoint], scale: float = 1.0, active: bool = True) -> None:
+    visible = [(index, x * scale, y * scale, v) for index, (x, y, v) in enumerate(points) if v > 0]
+    for (_, x1, y1, _), (_, x2, y2, _) in zip(visible, visible[1:]):
+        cv2.line(view, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 255) if active else (160, 160, 160), 1, cv2.LINE_AA)
+    radius = 6 if active else 5
+    for index, x, y, v in visible:
+        center = (int(round(x)), int(round(y)))
+        cv2.circle(view, center, radius + 2, (0, 0, 0), -1, cv2.LINE_AA)
+        if v == 2:
+            cv2.circle(view, center, radius, kpt_color(index), -1, cv2.LINE_AA)
+        else:
+            cv2.circle(view, center, radius, kpt_color(index), 2, cv2.LINE_AA)
+        draw_text(view, str(index), (center[0] + 8, center[1] - 8), 0.5)
+
+
+class KeypointCollector:
+    """Mouse state for clicking keypoints in order. Coordinates are stored in source pixels."""
+    def __init__(self, kpt_count: int, scale: float):
+        self.kpt_count = kpt_count
+        self.scale = scale
+        self.points: list[Keypoint] = []
+
+    @property
+    def done(self) -> bool:
+        return len(self.points) >= self.kpt_count
+
+    def on_mouse(self, event, x, y, flags, _param=None) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN or self.done:
+            return
+        v = 1 if flags & cv2.EVENT_FLAG_SHIFTKEY else 2
+        self.points.append([x / self.scale, y / self.scale, v])
+
+    def skip(self) -> None:
+        if not self.done:
+            self.points.append([0.0, 0.0, 0])
+
+    def undo(self) -> None:
+        if self.points:
+            self.points.pop()
+
+
+def collect_keypoints(frame, kpt_names: Sequence[str], scale: float, title: str) -> Optional[list[Keypoint]]:
+    """Click keypoints in order. Shift+click = occluded, s = skip, u/Backspace = undo, Enter = confirm, Esc = cancel."""
+    window = "Pose keypoints"
+    collector = KeypointCollector(len(kpt_names), scale)
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, collector.on_mouse)
+    try:
+        while True:
+            view = resize_for_display(frame.copy(), scale)
+            draw_keypoints(view, collector.points, scale)
+            index = len(collector.points)
+            if collector.done:
+                prompt = "all keypoints set: Enter confirms | u: undo last | Esc: cancel"
+            else:
+                prompt = f"click {index + 1}/{len(kpt_names)}: {kpt_names[index]}"
+            lines = [title, prompt, "click: visible | shift+click: occluded | s: skip (not visible) | u/backspace: undo | Esc: cancel"]
+            y = 24
+            for text in lines:
+                draw_text(view, text, (12, y), 0.56)
+                y += 24
+            cv2.imshow(window, view)
+            key = cv2.waitKey(30) & 0xFF
+            if key == 27:
+                return None
+            if key in (13, 10) and collector.done:
+                if not any(v > 0 for _, _, v in collector.points):
+                    print("at least one visible or occluded keypoint is required", flush=True)
+                    continue
+                return collector.points
+            if key == ord("s"):
+                collector.skip()
+            elif key in (ord("u"), 8, 127):
+                collector.undo()
+    finally:
+        cv2.destroyWindow(window)
+
+
 def resize_for_display(frame, scale: float):
     if scale == 1.0:
         return frame
@@ -318,7 +433,21 @@ def create_track_object(frame, bbox: BBox, labels: Sequence[str], args, obj_id: 
     return TrackObject(obj_id=obj_id, label=label, bbox=bbox, tracker=tracker, ok=True)
 
 
+def create_pose_object(frame, labels: Sequence[str], args, obj_id: int, window_title: str) -> Optional[TrackObject]:
+    keypoints = collect_keypoints(frame, args.kpt_names, args.display_scale, window_title)
+    if keypoints is None:
+        return None
+    bbox = bbox_from_keypoints(keypoints, frame.shape[1], frame.shape[0])
+    obj = create_track_object(frame, bbox, labels, args, obj_id)
+    if obj is not None:
+        obj.keypoints = keypoints
+        obj.bbox_auto = True
+    return obj
+
+
 def add_object_interactive(frame, labels: Sequence[str], args, obj_id: int, window_title: str = "Select object box, Enter confirms, Esc cancels") -> Optional[TrackObject]:
+    if args.task == "pose":
+        return create_pose_object(frame, labels, args, obj_id, window_title.replace("box", "keypoints"))
     bbox = select_bbox(window_title, frame, args.display_scale)
     if bbox is None:
         return None
@@ -353,10 +482,14 @@ def draw_overlay(frame, objects: Sequence[TrackObject], active_idx: int, frame_i
         if not obj.ok:
             label += " LOST"
         draw_text(view, label, (x, max(18, y - 6)), 0.58, (245, 255, 245))
+        if obj.keypoints:
+            draw_keypoints(view, obj.keypoints, 1.0, idx == active_idx)
     ok_count = sum(1 for obj in objects if obj.ok)
+    pose = any(obj.keypoints for obj in objects)
     lines = [
         f"frame: {frame_idx}  saved: {saved}  interval: {interval}  objects: {ok_count}/{len(objects)}",
-        "space: pause/resume | a: add box | r: reset active | v: add active view | tab/n: next | d: delete active",
+        ("space: pause/resume | a: add keypoints | k: re-label active keypoints | r: redraw active box | tab/n: next | d: delete active"
+         if pose else "space: pause/resume | a: add box | r: reset active | v: add active view | tab/n: next | d: delete active"),
         "s: save current | +/-: change interval | q/esc: quit",
     ]
     if objects:
@@ -398,6 +531,37 @@ def write_voc_xml(xml_path: Path, image_name: str, width: int, height: int, dept
     tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
 
 
+def sync_classes_file(annotations_dir: Path, labels: Sequence[str]) -> None:
+    """classes.txt fixes the class id order used by pose txt labels; refuse to silently reorder it."""
+    classes_path = annotations_dir / "classes.txt"
+    labels = list(labels)
+    if classes_path.is_file():
+        existing = [line.strip() for line in classes_path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        if existing != labels[:len(existing)]:
+            raise SystemExit(
+                f"{classes_path} lists {existing}, which does not match --labels {labels}; "
+                "use the same label order or another --annotations-dir"
+            )
+        if len(existing) >= len(labels):
+            return
+    classes_path.write_text("\n".join(labels) + "\n", encoding="utf-8")
+
+
+def write_pose_txt(txt_path: Path, width: int, height: int, objects: Sequence[TrackObject], labels: Sequence[str]) -> None:
+    """Write YOLO pose rows: cls cx cy w h x0 y0 v0 ... normalized to this image."""
+    rows = []
+    for obj in objects:
+        x, y, w, h = obj.bbox
+        parts = [str(labels.index(obj.label)), f"{(x + w / 2) / width:.6f}", f"{(y + h / 2) / height:.6f}", f"{w / width:.6f}", f"{h / height:.6f}"]
+        for px, py, v in obj.keypoints:
+            if v <= 0 or not (0 <= px < width and 0 <= py < height):
+                parts += ["0.000000", "0.000000", "0"]
+            else:
+                parts += [f"{px / width:.6f}", f"{py / height:.6f}", str(int(v))]
+        rows.append(" ".join(parts))
+    txt_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
 def save_sample(
     frame,
     objects: Sequence[TrackObject],
@@ -406,21 +570,29 @@ def save_sample(
     saved: int,
     source_image_path: Optional[Path] = None,
 ) -> int:
-    boxes = [(obj.label, obj.bbox) for obj in objects if obj.ok]
-    if not boxes:
+    pose = args.task == "pose"
+    if pose:
+        kept = [obj for obj in objects if obj.ok and len(obj.keypoints) == args.kpt_count]
+    else:
+        kept = [obj for obj in objects if obj.ok]
+    if not kept:
         return saved
     h, w = frame.shape[:2]
     depth = frame.shape[2] if len(frame.shape) == 3 else 1
+    suffix = ".txt" if pose else ".xml"
     if source_image_path is not None:
         image_name = source_image_path.name
-        xml_path = args.annotations_dir / f"{source_image_path.stem}.xml"
+        label_path = args.annotations_dir / f"{source_image_path.stem}{suffix}"
     else:
         stem = f"{args.prefix}_{frame_idx:06d}"
         image_name = stem + ".jpg"
         image_path = args.images_dir / image_name
         cv2.imwrite(str(image_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality])
-        xml_path = args.annotations_dir / (stem + ".xml")
-    write_voc_xml(xml_path, image_name, w, h, depth, boxes)
+        label_path = args.annotations_dir / (stem + suffix)
+    if pose:
+        write_pose_txt(label_path, w, h, kept, args.labels_list)
+    else:
+        write_voc_xml(label_path, image_name, w, h, depth, [(obj.label, obj.bbox) for obj in kept])
     return saved + 1
 
 
@@ -462,7 +634,7 @@ def choose_initial_image(image_files: Sequence[Path], start_idx: int, args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Track one or more objects in a video or ordered image set and export VOC annotations.")
+    parser = argparse.ArgumentParser(description="Track one or more objects in a video or ordered image set and export VOC annotations (detect) or YOLO pose txt (pose).")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video", help="video path or camera index")
     source.add_argument("--images-input-dir", type=Path, help="ordered source image directory; XML files are written without copying images")
@@ -484,7 +656,26 @@ def parse_args():
     parser.add_argument("--max-frames", type=int, default=0, help="maximum frames/images to process")
     parser.add_argument("--display-scale", type=float, default=1.0)
     parser.add_argument("--jpeg-quality", type=int, default=95)
-    return parser.parse_args()
+    parser.add_argument("--task", default="detect", choices=["detect", "pose"], help="detect writes VOC XML; pose writes YOLO pose txt + classes.txt")
+    parser.add_argument("--kpt-count", type=int, default=6, help="pose: keypoints per object")
+    parser.add_argument(
+        "--kpt-names",
+        default=None,
+        help="pose: comma separated keypoint names in click order; count must match --kpt-count "
+        "(default: safe-zone names when --kpt-count is 6, else kpt0..kptN)",
+    )
+    args = parser.parse_args()
+    if args.task == "pose":
+        if not 1 <= args.kpt_count <= 64:
+            parser.error("--kpt-count must be between 1 and 64")
+        if args.kpt_names is None:
+            names = list(DEFAULT_SAFE_ZONE_KPT_NAMES) if args.kpt_count == 6 else parse_kpt_names("", args.kpt_count)
+        else:
+            names = parse_kpt_names(args.kpt_names, args.kpt_count)
+        if len(names) != args.kpt_count:
+            parser.error(f"--kpt-names has {len(names)} names but --kpt-count is {args.kpt_count}")
+        args.kpt_names = names
+    return args
 
 
 
@@ -534,6 +725,9 @@ def main():
     args = parse_args()
     args.annotations_dir.mkdir(parents=True, exist_ok=True)
     labels = parse_labels(args.labels or args.label)
+    args.labels_list = labels
+    if args.task == "pose":
+        sync_classes_file(args.annotations_dir, labels)
     image_files: Optional[list[Path]] = None
 
     if args.images_input_dir is not None:
@@ -573,13 +767,19 @@ def main():
 
     print("labels=" + ",".join(labels), flush=True)
     print(f"source={source_mode}", flush=True)
+    print(f"task={args.task}", flush=True)
     print("Initial selection: press a/d to step backward/forward, Enter or Space starts labeling.", flush=True)
-    print("Initial labeling: draw one box, choose its label, then repeat. Press Esc in ROI window when all initial objects are selected.", flush=True)
+    if args.task == "pose":
+        print("kpt_names=" + ",".join(args.kpt_names), flush=True)
+        print("Initial labeling: click keypoints in order (shift+click occluded, s skip), Enter confirms, choose label, repeat. Esc finishes.", flush=True)
+        print("Keypoints follow the tracked box approximately; pause and press k to re-label them when they drift.", flush=True)
+    else:
+        print("Initial labeling: draw one box, choose its label, then repeat. Press Esc in ROI window when all initial objects are selected.", flush=True)
     if args.tracker == "multi_template":
         print("Multi-view tracking: pause on a new angle, select the active object, press v, and redraw that same object to add a reference view.", flush=True)
     objects = initial_objects(frame, labels, args)
     if not objects:
-        raise SystemExit("no box selected")
+        raise SystemExit("no keypoints labeled" if args.task == "pose" else "no box selected")
 
     saved = save_sample(frame, objects, args, frame_idx, 0, source_image_path)
     processed = 0
@@ -619,7 +819,10 @@ def main():
                 if not obj.ok:
                     continue
                 tracking_ok, next_bbox = update_tracker(obj.tracker, frame)
-                obj.bbox = sanitize_bbox(next_bbox, frame.shape[1], frame.shape[0])
+                next_bbox = sanitize_bbox(next_bbox, frame.shape[1], frame.shape[0])
+                if tracking_ok and obj.keypoints:
+                    obj.keypoints = follow_keypoints(obj.keypoints, obj.bbox, next_bbox)
+                obj.bbox = next_bbox
                 obj.ok = tracking_ok
 
             if objects and args.interval > 0 and frame_idx % args.interval == 0:
@@ -655,6 +858,7 @@ def main():
             if new_bbox is not None:
                 obj = objects[active_idx]
                 obj.bbox = new_bbox
+                obj.bbox_auto = False
                 obj.tracker = make_tracker(args.tracker)
                 obj.ok = init_tracker(obj.tracker, frame, obj.bbox)
                 obj.sample_count = 1
@@ -663,13 +867,28 @@ def main():
             new_bbox = select_bbox("Add active object view, Enter confirms, Esc cancels", frame, args.display_scale)
             if new_bbox is not None:
                 obj = objects[active_idx]
+                old_bbox = obj.bbox
                 if add_tracker_sample(obj.tracker, frame, new_bbox):
+                    if obj.keypoints:
+                        obj.keypoints = follow_keypoints(obj.keypoints, old_bbox, new_bbox)
                     obj.bbox = new_bbox
                     obj.ok = True
                     obj.sample_count += 1
                     paused = False
                 else:
                     print("Adding reference views requires --tracker multi_template; use r to reset other trackers.", flush=True)
+        elif key == ord("k") and objects and args.task == "pose":
+            obj = objects[active_idx]
+            keypoints = collect_keypoints(frame, args.kpt_names, args.display_scale, f"Re-label #{obj.obj_id} {obj.label} keypoints")
+            if keypoints is not None:
+                obj.keypoints = keypoints
+                if obj.bbox_auto or not obj.ok:
+                    obj.bbox = bbox_from_keypoints(keypoints, frame.shape[1], frame.shape[0])
+                    obj.bbox_auto = True
+                obj.tracker = make_tracker(args.tracker)
+                obj.ok = init_tracker(obj.tracker, frame, obj.bbox)
+                obj.sample_count = 1
+                paused = False
         elif key == ord("d") and objects:
             del objects[active_idx]
             active_idx = max(0, min(active_idx, len(objects) - 1))

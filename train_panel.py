@@ -19,7 +19,7 @@ import webbrowser
 
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,8 +71,13 @@ DEFAULT_VALUES: dict[str, Any] = {
     "train_task": "detect",
     "train_images_dir": str(SCRIPT_ROOT / "images"),
     "train_annotations_dir": str(SCRIPT_ROOT / "annotations"),
+    "kpt_count": "6",
+    "flip_idx": "1,0,3,2,4,5",
+    "kpt_sigmas": "",
+    "pose_classes": "",
     "train_ratio_percent": "80",
     "split_mode": "video_group",
+    "val_groups": "",
     "img_width": "448",
     "img_height": "448",
     "image_resize_mode": "letterbox",
@@ -111,10 +116,20 @@ DEFAULT_VALUES: dict[str, Any] = {
     "label_source_type": "video",
     "label_images_input_dir": "",
     "label_name": "w",
+    "label_task": "detect",
+    "label_kpt_count": "6",
+    "label_kpt_names": "entry_left,entry_right,inner_right,inner_left,divider_entry,divider_inner",
 
     "label_interval": "5",
     "label_images_dir": str(SCRIPT_ROOT / "images"),
     "label_annotations_dir": str(SCRIPT_ROOT / "annotations"),
+    # 检测/Pose 各自记住一套 Labels 与目录，切换标注任务时自动换回
+    "label_detect_name": "",
+    "label_detect_images_dir": "",
+    "label_detect_annotations_dir": "",
+    "label_pose_name": "",
+    "label_pose_images_dir": "",
+    "label_pose_annotations_dir": "",
     "label_prefix": "track",
     "label_tracker": "csrt",
     "label_start_frame": "0",
@@ -182,6 +197,9 @@ class LabelTrackObject:
     ok: bool = True
     sample_count: int = 1
     hidden: bool = False
+    # Pose mode: [[x, y, v], ...] in source pixels, v: 0 absent, 1 occluded, 2 visible.
+    keypoints: list = field(default_factory=list)
+    bbox_auto: bool = False
 
 
 class TemplateTracker:
@@ -325,10 +343,138 @@ def label_object_data(obj: LabelTrackObject) -> dict[str, Any]:
     return {
         "id": obj.obj_id, "label": obj.label, "x": x, "y": y, "w": w, "h": h,
         "ok": obj.ok, "sample_count": obj.sample_count, "hidden": obj.hidden,
+        "keypoints": [[round(px, 1), round(py, 1), int(v)] for px, py, v in obj.keypoints],
+        "bbox_auto": obj.bbox_auto,
     }
 
 
+def parse_label_keypoints(raw, kpt_count: int, width: int, height: int) -> list[list[float]]:
+    if not isinstance(raw, list) or len(raw) != kpt_count:
+        raise ValueError(f"需要按顺序标注 {kpt_count} 个关键点（不可见的点请点“跳过此点”）。")
+    points = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            raise ValueError("关键点格式错误，应为 [x, y, v]。")
+        v = int(item[2])
+        if v not in (0, 1, 2):
+            raise ValueError("关键点可见性只能为 0、1、2。")
+        if v == 0:
+            points.append([0.0, 0.0, 0])
+            continue
+        x = max(0.0, min(float(item[0]), width - 1.0))
+        y = max(0.0, min(float(item[1]), height - 1.0))
+        points.append([x, y, v])
+    if not any(v > 0 for _, _, v in points):
+        raise ValueError("至少需要一个可见或遮挡的关键点。")
+    return points
+
+
+def bbox_from_keypoints(points: list[list[float]], width: int, height: int, margin: float = 0.08) -> tuple[int, int, int, int]:
+    """Derive an object box from labeled keypoints with a small margin (min 8 px)."""
+    xs = [x for x, _, v in points if v > 0]
+    ys = [y for _, y, v in points if v > 0]
+    x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+    pad_x = max(8.0, (x2 - x1) * margin)
+    pad_y = max(8.0, (y2 - y1) * margin)
+    x1, y1 = max(0.0, x1 - pad_x), max(0.0, y1 - pad_y)
+    x2, y2 = min(width - 1.0, x2 + pad_x), min(height - 1.0, y2 + pad_y)
+    return sanitize_label_bbox((x1, y1, max(3.0, x2 - x1), max(3.0, y2 - y1)), width, height)
+
+
+def follow_keypoints(points: list[list[float]], old_bbox, new_bbox) -> list[list[float]]:
+    """Move keypoints with the tracked box (scale + translate). Approximate; correct by re-labeling."""
+    ox, oy, ow, oh = old_bbox
+    nx, ny, nw, nh = new_bbox
+    sx, sy = nw / max(1, ow), nh / max(1, oh)
+    return [[nx + (x - ox) * sx, ny + (y - oy) * sy, v] if v > 0 else [x, y, v] for x, y, v in points]
+
+
+# Pose tracking: the zones lie on one flat board, so all keypoints follow a single homography.
+POSE_PLANE_LK = dict(winSize=(21, 21), maxLevel=4, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+POSE_PLANE_MIN_INLIERS = 30
+# Normal frame-to-frame area change of the zone region stays within about ±6%.
+POSE_PLANE_MAX_AREA_CHANGE = 0.15
+
+
+def estimate_pose_plane(prev_frame, frame, anchors: np.ndarray) -> tuple[Optional[np.ndarray], str]:
+    """Fit the frame-to-frame homography of the plane spanned by the visible keypoints.
+
+    Features are re-detected every frame around the current keypoints, tracked with
+    forward-backward checked LK flow and fitted with RANSAC, so hands or blocks on the
+    board drop out as outliers. Returns (None, reason) when the motion is unreliable.
+    """
+    height, width = frame.shape[:2]
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros((height, width), np.uint8)
+    corners = np.round(anchors).astype(np.int32)
+    cv2.fillConvexPoly(mask, cv2.convexHull(corners), 255)
+    for x, y in corners:
+        cv2.circle(mask, (int(x), int(y)), 30, 255, -1)
+    mask = cv2.dilate(mask, np.ones((61, 61), np.uint8))
+    points = cv2.goodFeaturesToTrack(prev_gray, 600, 0.01, 8, mask=mask)
+    if points is None or len(points) < POSE_PLANE_MIN_INLIERS:
+        return None, "安全区附近可跟踪的纹理太少"
+    moved, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, points, None, **POSE_PLANE_LK)
+    back, back_status, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, moved, None, **POSE_PLANE_LK)
+    error = np.linalg.norm((back - points).reshape(-1, 2), axis=1)
+    good = (status.ravel() == 1) & (back_status.ravel() == 1) & (error < 1.0)
+    if good.sum() < POSE_PLANE_MIN_INLIERS:
+        return None, f"可靠特征点只有 {int(good.sum())} 个（画面模糊或遮挡过多）"
+    homography, inliers = cv2.findHomography(points[good], moved[good], cv2.RANSAC, 2.0)
+    count = 0 if inliers is None else int(inliers.sum())
+    if homography is None or count < POSE_PLANE_MIN_INLIERS:
+        return None, f"平面匹配点只有 {count} 个（画面模糊或遮挡过多）"
+    projected = cv2.perspectiveTransform(anchors.reshape(-1, 1, 2), homography).reshape(-1, 2)
+    if not np.all(np.isfinite(projected)):
+        return None, "平面变换异常"
+    if len(anchors) >= 3:
+        before = cv2.contourArea(cv2.convexHull(anchors))
+        after = cv2.contourArea(cv2.convexHull(projected.astype(np.float32)))
+        if before > 1 and abs(after / before - 1) > POSE_PLANE_MAX_AREA_CHANGE:
+            return None, f"单帧尺度突变 {after / before:.2f} 倍"
+    return homography, ""
+
+
+def follow_pose_plane(prev_frame, frame, objects: list["LabelTrackObject"]) -> str:
+    """Move all pose objects with one plane homography; returns a warning that should pause playback."""
+    anchors = np.float32([[x, y] for obj in objects for x, y, v in obj.keypoints if v > 0])
+    if not len(anchors):
+        return ""
+    homography, warning = estimate_pose_plane(prev_frame, frame, anchors)
+    if homography is None:
+        return f"跟踪不可靠：{warning}，角点保持不动；请确认或拖动角点修正后继续"
+    height, width = frame.shape[:2]
+    exits = []
+    for obj in objects:
+        points = np.float32([[x, y] for x, y, _ in obj.keypoints]).reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(points, homography).reshape(-1, 2)
+        keypoints = []
+        for index, ((x, y, v), (nx, ny)) in enumerate(zip(obj.keypoints, projected)):
+            if v <= 0:
+                keypoints.append([x, y, v])
+                continue
+            # Keep off-screen coordinates so a point can come back when the camera pans back.
+            if 0 <= x < width and 0 <= y < height and not (0 <= nx < width and 0 <= ny < height):
+                exits.append(f"#{obj.obj_id} {obj.label} 第 {index + 1} 点")
+            keypoints.append([float(nx), float(ny), v])
+        obj.keypoints = keypoints
+        if obj.bbox_auto:
+            obj.bbox = bbox_from_keypoints(obj.keypoints, width, height)
+        else:
+            x, y, w, h = obj.bbox
+            box = cv2.perspectiveTransform(np.float32([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]).reshape(-1, 1, 2), homography).reshape(-1, 2)
+            x1, y1 = box.min(axis=0)
+            x2, y2 = box.max(axis=0)
+            obj.bbox = sanitize_label_bbox((x1, y1, x2 - x1, y2 - y1), width, height)
+    if exits:
+        return f"{'、'.join(exits)} 移出画面，保存时记为不可见（v=0）；请确认后继续"
+    return ""
+
+
 LABEL_SESSIONS: dict[str, dict[str, Any]] = {}
+# Each undo entry keeps a copy of the saved frame (~2.7 MB at 720p), so cap the depth.
+LABEL_UNDO_LIMIT = 50
 LABEL_SESSIONS_LOCK = threading.RLock()
 
 
@@ -764,6 +910,9 @@ def estimate_train_resources(values: dict[str, Any]) -> dict[str, Any]:
             "per_image_vram": profile["per_image_vram"] * 0.55,
             "base_ram": profile["base_ram"] * 0.8,
         }
+    elif train_task == "pose":
+        # Pose head and keypoint targets add a little memory over plain detection.
+        profile = {**profile, "base_vram": profile["base_vram"] * 1.1, "per_image_vram": profile["per_image_vram"] * 1.15}
     image_count = 0
     image_bytes = 0
     sampled_images = 0
@@ -910,6 +1059,10 @@ def append_epoch_history(progress: dict[str, Any]) -> None:
         "box_loss": progress.get("box_loss"),
         "cls_loss": progress.get("cls_loss"),
         "dfl_loss": progress.get("dfl_loss"),
+        "pose_loss": progress.get("pose_loss"),
+        "kobj_loss": progress.get("kobj_loss"),
+        "pose_map50": progress.get("metrics", {}).get("pose_map50"),
+        "pose_map50_95": progress.get("metrics", {}).get("pose_map50_95"),
         "precision": progress.get("metrics", {}).get("precision"),
         "recall": progress.get("metrics", {}).get("recall"),
         "map50": progress.get("metrics", {}).get("map50"),
@@ -930,6 +1083,38 @@ def parse_train_output(line: str) -> None:
     if not clean:
         return
     now = time.strftime("%H:%M:%S")
+    pose_match = re.search(
+        r"(?P<epoch>\d+)\s*/\s*(?P<total_epochs>\d+)\s+(?P<gpu_mem>\S+)\s+"
+        r"(?P<box_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+        r"(?P<pose_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+        r"(?P<kobj_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+        r"(?P<cls_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+        r"(?P<dfl_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
+        r"(?:[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s+)?"
+        r"(?P<instances>\d+)\s+(?P<size>\d+)\s*:\s*(?P<percent>\d+(?:\.\d+)?)%.*?"
+        r"(?P<batch>\d+)\s*/\s*(?P<total_batches>\d+)"
+        r"(?:\s+(?P<speed>[\d.]+it/s))?(?:\s+(?P<elapsed>[^<\s]+))?(?:<(?P<eta>\S+))?",
+        clean,
+    )
+    if pose_match:
+        data = pose_match.groupdict()
+        with STATE_LOCK:
+            progress = STATE["train_progress"]
+            progress.update({
+                "phase": "train", "task": "pose", "epoch": parse_int(data["epoch"]) or 0,
+                "total_epochs": parse_int(data["total_epochs"]) or 0, "batch": parse_int(data["batch"]) or 0,
+                "total_batches": parse_int(data["total_batches"]) or 0, "percent": parse_float(data["percent"]) or 0.0,
+                "gpu_mem": data.get("gpu_mem") or "", "loss": None, "box_loss": parse_float(data["box_loss"]),
+                "pose_loss": parse_float(data["pose_loss"]), "kobj_loss": parse_float(data["kobj_loss"]),
+                "cls_loss": parse_float(data["cls_loss"]), "dfl_loss": parse_float(data["dfl_loss"]),
+                "instances": parse_int(data["instances"]), "size": parse_int(data["size"]),
+                "speed": data.get("speed") or "", "elapsed": data.get("elapsed") or "", "eta": data.get("eta") or "",
+                "updated_at": now,
+            })
+            if progress["percent"] >= 100:
+                append_epoch_history(progress)
+        return
+
     detect_match = re.search(
         r"(?P<epoch>\d+)\s*/\s*(?P<total_epochs>\d+)\s+(?P<gpu_mem>\S+)\s+"
         r"(?P<box_loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+"
@@ -986,7 +1171,8 @@ def parse_train_output(line: str) -> None:
     if val_match:
         data = val_match.groupdict()
         with STATE_LOCK:
-            STATE["train_progress"].update({"phase": "val", "task": "detect", "val_batch": parse_int(data["batch"]) or 0, "val_total": parse_int(data["total"]) or 0, "val_percent": parse_float(data["percent"]) or 0.0, "updated_at": now})
+            task = "pose" if STATE["train_progress"].get("task") == "pose" else "detect"
+            STATE["train_progress"].update({"phase": "val", "task": task, "val_batch": parse_int(data["batch"]) or 0, "val_total": parse_int(data["total"]) or 0, "val_percent": parse_float(data["percent"]) or 0.0, "updated_at": now})
         return
 
     classify_val_match = re.search(r"classes\s+top1_acc\s+top5_acc\s*:\s*(?P<percent>\d+(?:\.\d+)?)%.*?(?P<batch>\d+)\s*/\s*(?P<total>\d+)", clean, re.IGNORECASE)
@@ -994,6 +1180,22 @@ def parse_train_output(line: str) -> None:
         data = classify_val_match.groupdict()
         with STATE_LOCK:
             STATE["train_progress"].update({"phase": "val", "task": "classify", "val_batch": parse_int(data["batch"]) or 0, "val_total": parse_int(data["total"]) or 0, "val_percent": parse_float(data["percent"]) or 0.0, "updated_at": now})
+        return
+
+    num = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    pose_metric_match = re.match(r"^all\s+(\d+)\s+(\d+)" + (r"\s+" + num) * 8 + r"$", clean)
+    if pose_metric_match:
+        groups = pose_metric_match.groups()
+        values = [parse_float(item) for item in groups[2:]]
+        metrics = {
+            "images": parse_int(groups[0]), "instances": parse_int(groups[1]),
+            "precision": values[0], "recall": values[1], "map50": values[2], "map50_95": values[3],
+            "pose_precision": values[4], "pose_recall": values[5], "pose_map50": values[6], "pose_map50_95": values[7],
+        }
+        with STATE_LOCK:
+            progress = STATE["train_progress"]
+            progress.update({"phase": "metrics", "task": "pose", "metrics": metrics, "val_percent": 100.0, "updated_at": now})
+            append_epoch_history(progress)
         return
 
     detect_metric_match = re.match(r"^all\s+(?P<images>\d+)\s+(?P<instances>\d+)\s+(?P<precision>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+(?P<recall>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+(?P<map50>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+(?P<map50_95>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)$", clean)
@@ -1089,6 +1291,17 @@ def parse_rknn_output(line: str) -> None:
             progress.update({"partial_success": value, "message": "非量化模型可用，INT8 失败", "updated_at": now})
 
 
+def pose_args(values: dict[str, Any]) -> list[Any]:
+    if values.get("train_task") != "pose":
+        return []
+    args: list[Any] = ["--kpt-count", str(values.get("kpt_count") or "").strip()]
+    for key, option in (("flip_idx", "--flip-idx"), ("kpt_sigmas", "--kpt-sigmas"), ("pose_classes", "--pose-classes")):
+        text = str(values.get(key) or "").strip()
+        if text:
+            args += [option, text]
+    return args
+
+
 def build_common_args(values: dict[str, Any], stage: str) -> list[Any]:
     return [
         sys.executable,
@@ -1098,8 +1311,10 @@ def build_common_args(values: dict[str, Any], stage: str) -> list[Any]:
         "--train-task", values["train_task"],
         "--images-dir", values["train_images_dir"],
         "--annotations-dir", values["train_annotations_dir"],
+        *pose_args(values),
         "--train-ratio-percent", values["train_ratio_percent"],
         "--split-mode", values["split_mode"],
+        "--val-groups", values.get("val_groups", ""),
         "--img-width", values["img_width"],
         "--img-height", values["img_height"],
         "--image-resize-mode", values["image_resize_mode"],
@@ -1164,6 +1379,12 @@ def build_label_cmd(values: dict[str, Any]) -> list[Any]:
         cmd += ["--video", values["label_camera_index"]]
     else:
         cmd += ["--video", values["label_video"]]
+    if values.get("label_task") == "pose":
+        cmd += [
+            "--task", "pose",
+            "--kpt-count", values.get("label_kpt_count", "6"),
+            "--kpt-names", ",".join(parse_kpt_names(values.get("label_kpt_names", ""), int(values.get("label_kpt_count", "6") or 6))),
+        ]
     return cmd
 
 
@@ -1215,10 +1436,24 @@ def validate(action: str, values: dict[str, Any]) -> None:
         if not images_dir.is_dir():
             raise ValueError("Images Dir 必须是有效图片文件夹。")
         train_task = values.get("train_task", "detect")
-        if train_task not in {"detect", "classify"}:
-            raise ValueError("训练任务必须为目标检测或图像分类。")
+        if train_task not in {"detect", "classify", "pose"}:
+            raise ValueError("训练任务必须为目标检测、图像分类或关键点姿态。")
         if train_task == "detect" and not annotations_dir.is_dir():
             raise ValueError("目标检测需要有效的 XML 标注文件夹。")
+        if train_task == "pose":
+            if not annotations_dir.is_dir():
+                raise ValueError("关键点姿态训练需要有效的 YOLO pose txt 标注文件夹（填在 Annotations Dir）。")
+            kpt_count = parse_int(str(values.get("kpt_count", "")))
+            if not kpt_count or kpt_count < 1:
+                raise ValueError("关键点数量必须是大于 0 的整数。")
+            flip_text = str(values.get("flip_idx") or "").strip()
+            if flip_text:
+                try:
+                    flip_idx = [int(item) for item in re.split(r"[\s,]+", flip_text) if item]
+                except ValueError:
+                    raise ValueError("flip_idx 必须是逗号分隔的整数，例如 1,0,3,2,4,5。")
+                if sorted(flip_idx) != list(range(kpt_count)):
+                    raise ValueError(f"flip_idx 必须是 0..{kpt_count - 1} 的一个排列。")
         if train_task == "classify":
             class_dirs = [path for path in images_dir.iterdir() if path.is_dir()]
             if len(class_dirs) < 2:
@@ -1259,6 +1494,15 @@ def validate(action: str, values: dict[str, Any]) -> None:
             raise ValueError("请先从视频队列选择或填写视频路径。")
         if not values["label_name"].strip():
             raise ValueError("请先填写至少一个标签名称。")
+        if values.get("label_task", "detect") not in {"detect", "pose"}:
+            raise ValueError("标注任务只能为 detect 或 pose。")
+        if values.get("label_task") == "pose":
+            kpt_count = parse_int(values.get("label_kpt_count", ""))
+            if kpt_count is None or not 1 <= kpt_count <= 64:
+                raise ValueError("关键点数量必须是 1-64 的整数。")
+            names = parse_kpt_names(values.get("label_kpt_names", ""), kpt_count)
+            if len(names) != kpt_count:
+                raise ValueError(f"关键点名称数量为 {len(names)}，与关键点数量 {kpt_count} 不一致；可留空使用默认名称。")
     elif action == "rknn_deploy":
         if not RKNN_DEPLOY_SCRIPT.is_file():
             raise ValueError(f"未找到 RKNN 转换工具：{RKNN_DEPLOY_SCRIPT}")
@@ -1497,6 +1741,75 @@ def write_label_voc_xml(xml_path: Path, image_name: str, frame, objects: list[La
     ET.ElementTree(root).write(xml_path, encoding="UTF-8", xml_declaration=True)
 
 
+def parse_kpt_names(raw: str, kpt_count: int) -> list[str]:
+    names = [part.strip() for part in re.split(r"[,;\n]+", raw or "") if part.strip()]
+    return names or [f"kpt{index}" for index in range(kpt_count)]
+
+
+def sync_pose_classes_file(annotations_dir: Path, labels: list[str]) -> None:
+    """classes.txt fixes the class id order used by the txt labels; refuse to silently reorder it."""
+    classes_path = annotations_dir / "classes.txt"
+    if classes_path.is_file():
+        existing = [line.strip() for line in classes_path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        if existing[:len(labels)] == labels[:len(existing)] and len(existing) >= len(labels):
+            return
+        if existing != labels[:len(existing)]:
+            raise ValueError(f"标注目录已有 classes.txt={existing}，与当前 Labels={labels} 顺序不一致，会导致类别 id 错乱。请改用相同顺序的 Labels 或换一个标注目录。")
+    classes_path.write_text("\n".join(labels) + "\n", encoding="utf-8")
+
+
+def write_label_pose_txt(txt_path: Path, frame, objects: list[LabelTrackObject], labels: list[str], kpt_count: int) -> int:
+    """Write YOLO pose rows: cls cx cy w h x0 y0 v0 ... (normalized to this image)."""
+    height, width = frame.shape[:2]
+    rows = []
+    for obj in objects:
+        if not obj.ok or obj.hidden or len(obj.keypoints) != kpt_count or obj.label not in labels:
+            continue
+        x, y, w, h = obj.bbox
+        parts = [str(labels.index(obj.label)), f"{(x + w / 2) / width:.6f}", f"{(y + h / 2) / height:.6f}", f"{w / width:.6f}", f"{h / height:.6f}"]
+        for px, py, v in obj.keypoints:
+            inside = 0 <= px < width and 0 <= py < height
+            if v <= 0 or not inside:
+                parts += ["0.000000", "0.000000", "0"]
+            else:
+                parts += [f"{px / width:.6f}", f"{py / height:.6f}", str(int(v))]
+        rows.append(" ".join(parts))
+    if rows:
+        txt_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return len(rows)
+
+
+def parse_pose_txt(txt_path: Path, width: int, height: int, kpt_count: int = 0) -> list[dict[str, Any]]:
+    labels_dir = txt_path.parent
+    classes_path = labels_dir / "classes.txt"
+    names = [line.strip() for line in classes_path.read_text(encoding="utf-8-sig").splitlines() if line.strip()] if classes_path.is_file() else []
+    items = []
+    for line in txt_path.read_text(encoding="utf-8-sig").splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        values = [float(value) for value in parts]
+        cls = int(values[0])
+        cx, cy, bw, bh = values[1:5]
+        rest = values[5:]
+        # 6 points * 2 cols is also divisible by 3, so prefer the configured keypoint count.
+        if kpt_count > 0 and len(rest) in (kpt_count * 2, kpt_count * 3):
+            step = len(rest) // kpt_count
+        else:
+            step = 3 if len(rest) % 3 == 0 else 2
+        keypoints = []
+        for index in range(0, len(rest) - step + 1, step):
+            v = int(rest[index + 2]) if step == 3 else 2
+            keypoints.append([rest[index] * width, rest[index + 1] * height, v])
+        items.append({
+            "name": names[cls] if 0 <= cls < len(names) else f"class{cls}",
+            "xmin": int(round((cx - bw / 2) * width)), "ymin": int(round((cy - bh / 2) * height)),
+            "xmax": int(round((cx + bw / 2) * width)), "ymax": int(round((cy + bh / 2) * height)),
+            "keypoints": keypoints,
+        })
+    return items
+
+
 def label_session_state(session: dict[str, Any]) -> dict[str, Any]:
     frame = session["frame"]
     height, width = frame.shape[:2]
@@ -1510,12 +1823,18 @@ def label_session_state(session: dict[str, Any]) -> dict[str, Any]:
         "objects": [label_object_data(obj) for obj in session["objects"]],
         "labels": session["labels"],
         "tracker": session["tracker"],
+        "task": session["task"],
+        "kpt_count": session["kpt_count"],
+        "kpt_names": session["kpt_names"],
         "saved": session["saved"],
         "interval": session["interval"],
         "processed": session["processed"],
         "max_frames": session["max_frames"],
         "ended": session["ended"],
         "lost": any(not obj.ok and not obj.hidden for obj in session["objects"]),
+        "track_warning": session["track_warning"],
+        "undo_count": len(session["history"]),
+        "undo_frame": session["history"][-1]["frame_index"] if session["history"] else None,
     }
 
 
@@ -1593,19 +1912,25 @@ def start_label_session(values: dict[str, Any]) -> dict[str, Any]:
     if source_type != "images":
         images_dir.mkdir(parents=True, exist_ok=True)
     annotations_dir.mkdir(parents=True, exist_ok=True)
+    task = values.get("label_task", "detect")
+    labels = parse_label_names(values["label_name"])
+    kpt_count = int(values.get("label_kpt_count") or 0) if task == "pose" else 0
+    if task == "pose":
+        sync_pose_classes_file(annotations_dir, labels)
     session_id = uuid.uuid4().hex
     session = {
         "id": session_id, "lock": threading.RLock(), "source_type": source_type, "cap": cap, "files": files,
         "frame": frame, "frame_index": frame_index, "frame_count": frame_count, "source_image_path": source_image_path,
-        "objects": [], "next_object_id": 1, "saved": 0, "processed": 0, "ended": False,
-        "labels": parse_label_names(values["label_name"]), "tracker": values["label_tracker"],
+        "objects": [], "next_object_id": 1, "saved": 0, "history": [], "track_warning": "", "processed": 0, "ended": False,
+        "labels": labels, "tracker": values["label_tracker"],
+        "task": task, "kpt_count": kpt_count, "kpt_names": parse_kpt_names(values.get("label_kpt_names", ""), kpt_count) if task == "pose" else [],
         "interval": max(1, int(values["label_interval"] or 1)), "max_frames": max(0, int(values["label_max_frames"] or 0)),
         "images_dir": images_dir, "annotations_dir": annotations_dir, "prefix": values["label_prefix"].strip() or "track",
         "jpeg_quality": max(1, min(100, int(values["label_jpeg_quality"] or 95))),
     }
     with LABEL_SESSIONS_LOCK:
         LABEL_SESSIONS[session_id] = session
-    append_log(f"[网页标注] 会话已创建：{source_type}，请在页面框选目标。\n")
+    append_log(f"[网页标注] 会话已创建：{source_type}，任务 {task}{f'（{kpt_count} 个关键点，输出 YOLO pose txt）' if task == 'pose' else ''}，请在页面框选目标。\n")
     return label_session_state(session)
 
 
@@ -1621,24 +1946,100 @@ def write_label_image(image_path: Path, frame, jpeg_quality: int) -> None:
         raise ValueError(f"标注图片写入失败：{image_path}（{exc}）") from exc
 
 
-def save_label_session_sample(session: dict[str, Any]) -> bool:
-    objects = [obj for obj in session["objects"] if obj.ok and not obj.hidden]
-    if not objects:
-        return False
+def save_label_session_sample(session: dict[str, Any], allow_background: bool = False) -> str:
+    """Save the current frame; returns "sample", "background" or "" (nothing saved).
+
+    Background (negative) frames are only saved on manual request and only when the
+    session has no objects at all, so a lost or hidden target never becomes an empty label.
+    """
     frame = session["frame"]
+    pose = session["task"] == "pose"
+    background = allow_background and not session["objects"]
+    objects = [obj for obj in session["objects"] if obj.ok and not obj.hidden]
+    if pose:
+        objects = [obj for obj in objects if len(obj.keypoints) == session["kpt_count"]]
+    if not objects and not background:
+        return ""
+    suffix = ".txt" if pose else ".xml"
     source_image_path = session["source_image_path"]
     if source_image_path is not None:
         image_name = source_image_path.name
-        xml_path = session["annotations_dir"] / f"{source_image_path.stem}.xml"
+        label_path = session["annotations_dir"] / f"{source_image_path.stem}{suffix}"
     else:
         stem = f"{session['prefix']}_{session['frame_index']:06d}"
         image_name = stem + ".jpg"
         image_path = session["images_dir"] / image_name
+        label_path = session["annotations_dir"] / f"{stem}{suffix}"
+    written = [label_path] if source_image_path is not None else [image_path, label_path]
+    # Remember what the files held before this save so undo can restore an overwritten label.
+    previous = [(path, path.read_bytes() if path.is_file() else None) for path in written]
+    if source_image_path is None:
         write_label_image(image_path, frame, session["jpeg_quality"])
-        xml_path = session["annotations_dir"] / f"{stem}.xml"
-    write_label_voc_xml(xml_path, image_name, frame, objects)
+    if pose:
+        if background:
+            label_path.write_text("", encoding="utf-8")
+        else:
+            write_label_pose_txt(label_path, frame, objects, session["labels"], session["kpt_count"])
+    else:
+        write_label_voc_xml(label_path, image_name, frame, objects)
     session["saved"] += 1
-    return True
+    session["history"].append({
+        "files": previous, "frame": frame.copy(), "frame_index": session["frame_index"],
+        "source_image_path": source_image_path, "processed": session["processed"],
+        "objects": [snapshot_label_object(obj) for obj in session["objects"]],
+    })
+    del session["history"][:-LABEL_UNDO_LIMIT]
+    return "background" if background else "sample"
+
+
+def snapshot_label_object(obj: LabelTrackObject) -> dict[str, Any]:
+    return {
+        "obj_id": obj.obj_id, "label": obj.label, "bbox": tuple(obj.bbox), "ok": obj.ok, "hidden": obj.hidden,
+        "keypoints": [list(point) for point in obj.keypoints], "bbox_auto": obj.bbox_auto,
+    }
+
+
+def undo_label_session_save(session: dict[str, Any]) -> int:
+    """Remove the most recent save and rewind the session to that frame with the objects as saved.
+
+    The frame is not re-saved automatically; correct the targets and press save again.
+    """
+    if not session["history"]:
+        raise ValueError("没有可回退的保存记录（最多保留最近 %d 次）。" % LABEL_UNDO_LIMIT)
+    entry = session["history"].pop()
+    for path, content in entry["files"]:
+        try:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(content)
+        except OSError as exc:
+            raise ValueError(f"回退时文件处理失败：{path}（{exc}）") from exc
+    session["saved"] = max(0, session["saved"] - 1)
+    frame = entry["frame"]
+    session["frame"] = frame
+    session["frame_index"] = entry["frame_index"]
+    session["source_image_path"] = entry["source_image_path"]
+    session["processed"] = entry["processed"]
+    session["ended"] = False
+    session["track_warning"] = ""
+    if session["source_type"] == "video" and session["cap"] is not None:
+        # Next advance continues right after the rewound frame.
+        session["cap"].set(cv2.CAP_PROP_POS_FRAMES, entry["frame_index"] + 1)
+    objects = []
+    for item in entry["objects"]:
+        tracker = make_label_tracker(session["tracker"])
+        ok = item["ok"]
+        if ok and not item["hidden"]:
+            ok = init_label_tracker(tracker, frame, item["bbox"])
+        objects.append(LabelTrackObject(
+            item["obj_id"], item["label"], item["bbox"], tracker, ok=ok, hidden=item["hidden"],
+            keypoints=[list(point) for point in item["keypoints"]], bbox_auto=item["bbox_auto"],
+        ))
+    session["objects"] = objects
+    session["next_object_id"] = max([session["next_object_id"]] + [obj.obj_id + 1 for obj in objects])
+    append_log(f"[网页标注] 已回退第 {entry['frame_index']} 帧的保存。\n")
+    return entry["frame_index"]
 
 
 def advance_label_session(session: dict[str, Any]) -> dict[str, Any]:
@@ -1665,15 +2066,27 @@ def advance_label_session(session: dict[str, Any]) -> dict[str, Any]:
         else:
             session["frame_index"] = max(0, int(session["cap"].get(cv2.CAP_PROP_POS_FRAMES)) - 1)
         session["source_image_path"] = None
+    prev_frame = session["frame"]
     session["frame"] = frame
     session["processed"] += 1
+    session["track_warning"] = ""
+    pose_objects = []
     for obj in session["objects"]:
         if not obj.ok or obj.hidden:
             continue
+        if session["task"] == "pose" and obj.keypoints:
+            pose_objects.append(obj)
+            continue
         ok, bbox = obj.tracker.update(frame)
-        obj.bbox = sanitize_label_bbox(bbox, frame.shape[1], frame.shape[0])
+        new_bbox = sanitize_label_bbox(bbox, frame.shape[1], frame.shape[0])
+        if ok and obj.keypoints:
+            obj.keypoints = follow_keypoints(obj.keypoints, obj.bbox, new_bbox)
+        obj.bbox = new_bbox
         obj.ok = bool(ok)
-    if session["objects"] and session["frame_index"] % session["interval"] == 0:
+    if pose_objects:
+        session["track_warning"] = follow_pose_plane(prev_frame, frame, pose_objects)
+    # A frame whose tracking looks unreliable is never auto-saved.
+    if session["objects"] and not session["track_warning"] and session["frame_index"] % session["interval"] == 0:
         save_label_session_sample(session)
     return label_session_state(session)
 
@@ -1697,6 +2110,7 @@ def seek_label_session(session: dict[str, Any], frame_index: int) -> dict[str, A
     session["frame"] = frame
     session["frame_index"] = actual
     session["source_image_path"] = None
+    session["track_warning"] = ""
     # Trackers cannot safely resume after a random seek; force manual correction.
     for obj in session["objects"]:
         obj.ok = False
@@ -1750,13 +2164,15 @@ def list_label_results(values: dict[str, Any]) -> list[dict[str, Any]]:
     if not images_dir.is_dir() or not annotations_dir.is_dir():
         return []
     results = []
-    xml_files = sorted(annotations_dir.glob("*.xml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    pose = values.get("label_task") == "pose"
+    pattern = "*.txt" if pose else "*.xml"
+    xml_files = sorted((path for path in annotations_dir.glob(pattern) if path.name != "classes.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
     for xml_path in xml_files[:300]:
         try:
-            meta = parse_voc_xml(xml_path)
+            meta = {"filename": "", "boxes": []} if pose else parse_voc_xml(xml_path)
         except Exception:
             continue
-        image_path = images_dir / meta["filename"]
+        image_path = images_dir / meta["filename"] if meta["filename"] else images_dir / "__missing__"
         if not image_path.exists():
             for ext in (".jpg", ".jpeg", ".png", ".bmp"):
                 candidate = images_dir / (xml_path.stem + ext)
@@ -1765,6 +2181,12 @@ def list_label_results(values: dict[str, Any]) -> list[dict[str, Any]]:
                     break
         if not image_path.exists():
             continue
+        if pose:
+            try:
+                # Only the object count is shown in the list; the preview renders real coordinates.
+                meta["boxes"] = parse_pose_txt(xml_path, 1, 1, parse_int(values.get("label_kpt_count", "")) or 0)
+            except Exception:
+                continue
         results.append({
             "stem": xml_path.stem,
             "image": str(image_path),
@@ -2100,12 +2522,25 @@ def send_video_file(handler: BaseHTTPRequestHandler, video_path: Path) -> None:
 
 
 
-def render_label_preview(image_path: Path, xml_path: Path) -> bytes:
+def render_label_preview(image_path: Path, xml_path: Path, kpt_count: int = 0) -> bytes:
     frame = read_label_image(image_path)
-    meta = parse_voc_xml(xml_path)
+    if xml_path.suffix.lower() == ".txt":
+        meta = {"boxes": parse_pose_txt(xml_path, frame.shape[1], frame.shape[0], kpt_count)}
+    else:
+        meta = parse_voc_xml(xml_path)
     line_thickness = max(5, round(min(frame.shape[:2]) / 180))
     text_scale = max(0.7, min(frame.shape[:2]) / 1400)
     for box in meta["boxes"]:
+        radius = max(5, line_thickness + 2)
+        for index, (px, py, v) in enumerate(box.get("keypoints", [])):
+            if v <= 0:
+                continue
+            center = (int(round(px)), int(round(py)))
+            color = (0, 200, 255) if v == 2 else (160, 160, 160)
+            cv2.circle(frame, center, radius, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, center, radius - 2, color, -1, cv2.LINE_AA)
+            cv2.putText(frame, str(index), (center[0] + radius, center[1] - radius), cv2.FONT_HERSHEY_SIMPLEX, text_scale * 0.8, (0, 0, 0), line_thickness + 1, cv2.LINE_AA)
+            cv2.putText(frame, str(index), (center[0] + radius, center[1] - radius), cv2.FONT_HERSHEY_SIMPLEX, text_scale * 0.8, (255, 255, 255), max(1, line_thickness // 2), cv2.LINE_AA)
         p1 = (box["xmin"], box["ymin"])
         p2 = (box["xmax"], box["ymax"])
         cv2.rectangle(frame, p1, p2, (40, 220, 120), line_thickness, cv2.LINE_AA)
@@ -2127,6 +2562,7 @@ HTML_PAGE = r'''<!doctype html>
 <title>model-training-tool</title>
 <style>
 :root{--bg:#09111f;--panel:rgba(255,255,255,.08);--panel2:rgba(255,255,255,.13);--text:#eef6ff;--muted:#9fb0c7;--line:rgba(255,255,255,.14);--blue:#56a8ff;--green:#30d287;--purple:#a78bfa;--orange:#ffbd5a;--red:#ff6678;--shadow:0 24px 70px rgba(0,0,0,.35);font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;color:var(--text);background:radial-gradient(circle at 15% 10%,#173c73 0,#09111f 34%),radial-gradient(circle at 86% 0,#41226d 0,transparent 30%),linear-gradient(135deg,#09111f,#0c1528);min-height:100vh}.wrap{width:min(1380px,calc(100% - 36px));margin:0 auto;padding:28px 0 36px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;align-items:stretch;margin-bottom:18px}.card{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:26px;backdrop-filter:blur(18px)}.title{padding:30px}.eyebrow{display:inline-flex;gap:8px;align-items:center;color:#cde4ff;background:rgba(86,168,255,.13);border:1px solid rgba(86,168,255,.25);padding:7px 12px;border-radius:999px;font-size:13px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 16px var(--green)}h1{font-size:42px;letter-spacing:-.04em;margin:18px 0 10px}.subtitle{color:var(--muted);line-height:1.8;margin:0;max-width:780px}.guide{padding:24px}.steps{display:grid;gap:12px}.step{display:flex;gap:12px;align-items:flex-start;padding:13px;border:1px solid var(--line);background:rgba(255,255,255,.06);border-radius:18px}.num{flex:0 0 30px;width:30px;height:30px;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--purple));display:grid;place-items:center;font-weight:800}.step b{display:block;margin-bottom:3px}.step span{color:var(--muted);font-size:13px;line-height:1.5}.layout{display:grid;grid-template-columns:290px 1fr;gap:18px}.side{position:sticky;top:18px;height:fit-content;padding:16px}.nav{display:grid;gap:10px}.nav button{all:unset;cursor:pointer;padding:15px 16px;border-radius:18px;color:var(--muted);border:1px solid transparent;display:flex;justify-content:space-between;align-items:center}.nav button.active{background:linear-gradient(135deg,rgba(86,168,255,.22),rgba(167,139,250,.18));border-color:rgba(255,255,255,.18);color:var(--text)}.status{margin-top:14px;padding:14px;border-radius:18px;background:rgba(0,0,0,.23);border:1px solid var(--line);overflow:hidden}.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 11px;border-radius:999px;font-size:13px;border:1px solid var(--line);color:var(--muted);max-width:100%}.pill span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pill.run{color:#bff8dc;border-color:rgba(48,210,135,.35);background:rgba(48,210,135,.1)}.pill.idle{color:#d5e5ff;background:rgba(86,168,255,.08)}.main{display:grid;gap:18px}.tab{display:none}.tab.active{display:block}.section{padding:22px;margin-bottom:18px}.section h2{margin:0 0 6px;font-size:24px}.hint{margin:0 0 18px;color:var(--muted);line-height:1.65}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.field{grid-column:span 6}.field.sm{grid-column:span 3}.field.full{grid-column:1/-1}label{display:block;color:#d9e9ff;font-size:13px;margin:0 0 7px}input,select{width:100%;background:rgba(5,12,24,.72);border:1px solid var(--line);border-radius:14px;color:var(--text);padding:12px 13px;outline:none;transition:.2s}input:focus,select:focus{border-color:rgba(86,168,255,.72);box-shadow:0 0 0 4px rgba(86,168,255,.13)}.choice{display:flex;gap:10px;flex-wrap:wrap}.choice label{margin:0;cursor:pointer}.choice input{display:none}.choice span{display:inline-flex;padding:10px 13px;border-radius:14px;border:1px solid var(--line);background:rgba(255,255,255,.06);color:var(--muted)}.choice input:checked+span{color:var(--text);border-color:rgba(86,168,255,.58);background:rgba(86,168,255,.18)}.actions{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-top:18px}.log-input-actions{justify-content:flex-start;flex-wrap:nowrap}.log-input-actions #job-input{flex:1 1 0;min-width:0}.log-input-actions .job-input-secret-label{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;margin:0;white-space:nowrap}.log-input-actions input[type="checkbox"]{width:16px;height:16px;margin:0;padding:0;accent-color:var(--blue)}.log-input-actions .btn{flex:0 0 auto}@media(max-width:640px){.log-input-actions{flex-wrap:wrap}.log-input-actions #job-input{flex-basis:100%}.log-input-actions .btn{margin-left:auto}}.btns{display:flex;gap:10px;flex-wrap:wrap}.btn{all:unset;cursor:pointer;border-radius:15px;padding:12px 17px;font-weight:700;border:1px solid var(--line);background:var(--panel2)}.btn.primary{background:linear-gradient(135deg,#238bff,#8b5cf6);border:0}.btn.green{background:linear-gradient(135deg,#18aa69,#22c98a);border:0}.btn.blue{background:linear-gradient(135deg,#1877f2,#56a8ff);border:0}.btn.red{background:rgba(255,102,120,.14);border-color:rgba(255,102,120,.35);color:#ffd7dd}.cmd{margin-top:14px;background:#050b15;border:1px solid var(--line);border-radius:18px;padding:14px;color:#bad4f6;white-space:pre-wrap;word-break:break-all;font-family:"Cascadia Mono",Consolas,monospace;font-size:12px;line-height:1.55}.log{height:360px;overflow:auto;background:#030813;border:1px solid rgba(255,255,255,.12);border-radius:20px;padding:16px;white-space:pre-wrap;color:#c6f6d5;font-family:"Cascadia Mono",Consolas,monospace;font-size:12px;line-height:1.55}.toast{position:fixed;right:22px;bottom:22px;max-width:420px;padding:14px 16px;border-radius:16px;background:#101d33;border:1px solid var(--line);box-shadow:var(--shadow);display:none}.toast.show{display:block}.mini{color:var(--muted);font-size:12px;margin-top:7px}.markers{display:grid;gap:8px;margin-top:10px;min-width:0}.marker{display:grid;grid-template-columns:1fr;gap:5px;align-items:start;padding:10px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-size:12px;color:var(--muted);min-width:0;overflow:hidden}.marker b{color:#dcecff;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.marker span{min-width:0;overflow-wrap:anywhere;word-break:break-all;white-space:normal;line-height:1.45}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:16px}.sample{overflow:hidden;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.06)}.sample img{width:100%;display:block;aspect-ratio:16/10;object-fit:cover;background:#050b15}.sample .preview-trigger{all:unset;cursor:zoom-in;display:block;width:100%;position:relative}.sample .preview-trigger::after{content:'点击放大';position:absolute;right:10px;bottom:10px;padding:5px 8px;border-radius:999px;background:rgba(3,8,19,.72);border:1px solid rgba(255,255,255,.2);color:#fff;font-size:11px;opacity:0;transform:translateY(4px);transition:.18s}.sample .preview-trigger:hover::after,.sample .preview-trigger:focus-visible::after{opacity:1;transform:translateY(0)}.sample .preview-trigger:focus-visible{outline:2px solid var(--blue);outline-offset:-3px}.sample .meta{padding:11px;font-size:12px;color:var(--muted);display:grid;gap:8px}.sample .delete{all:unset;cursor:pointer;text-align:center;padding:9px 10px;border-radius:12px;background:rgba(255,102,120,.14);border:1px solid rgba(255,102,120,.35);color:#ffd7dd;font-weight:700}.empty{padding:16px;border:1px dashed var(--line);border-radius:18px;color:var(--muted);margin-top:14px}.input-action{display:flex;gap:10px;align-items:stretch}.input-action input{min-width:0;flex:1}.input-action .btn{white-space:nowrap}@media(max-width:520px){.input-action{flex-direction:column}}.label-workspace{display:grid;grid-template-columns:minmax(280px,360px) 1fr;gap:16px;margin-top:18px}.train-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px}.progress-card{border:1px solid var(--line);background:rgba(255,255,255,.055);border-radius:22px;padding:16px;overflow:hidden}.progress-card.wide{grid-column:1/-1}.progress-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.progress-head b{font-size:16px}.progress-head span{color:var(--muted);font-size:12px}.bar{height:16px;border-radius:999px;background:rgba(5,12,24,.72);border:1px solid var(--line);overflow:hidden}.bar div{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--blue),var(--purple));transition:width .25s ease}.metrics-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-top:12px}.metrics-grid div{padding:10px;border-radius:14px;background:rgba(0,0,0,.18);border:1px solid var(--line);min-width:0}.metrics-grid span{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}.metrics-grid b{display:block;color:#eff8ff;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.loss-grid{grid-template-columns:repeat(3,1fr)}canvas{width:100%;height:180px;margin-top:10px;border-radius:14px;background:rgba(3,8,19,.72);border:1px solid rgba(255,255,255,.1)}.panel{border:1px solid var(--line);background:rgba(255,255,255,.055);border-radius:22px;padding:16px}.panel h3{margin:0 0 10px;font-size:16px}.queue-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px}.count{color:var(--muted);font-size:12px}.video-list{display:grid;gap:8px;max-height:300px;overflow:auto;padding-right:4px}.video-preview{margin-top:14px}.video-preview-box{min-height:220px;border:1px dashed var(--line);border-radius:18px;background:rgba(5,12,24,.42);display:grid;place-items:center;overflow:hidden;color:var(--muted);font-size:12px;text-align:center;position:relative}.video-preview-box.clickable{cursor:pointer;border-style:solid;border-color:rgba(86,168,255,.42)}.video-preview-box img,.video-preview-box video{width:100%;height:100%;display:block;object-fit:contain;background:#050b15}.video-preview-box video{min-height:220px}.play-overlay{position:absolute;inset:0;display:grid;place-items:center;background:linear-gradient(180deg,rgba(5,12,24,.08),rgba(5,12,24,.48));pointer-events:none}.play-button{width:66px;height:66px;border-radius:50%;display:grid;place-items:center;background:rgba(86,168,255,.86);box-shadow:0 14px 36px rgba(0,0,0,.42);color:white;font-size:30px;line-height:1;transform:translateY(-2px)}.video-item{all:unset;cursor:pointer;display:grid;gap:5px;padding:11px 12px;border-radius:15px;border:1px solid var(--line);background:rgba(5,12,24,.42)}.video-item.active{border-color:rgba(86,168,255,.75);background:rgba(86,168,255,.16)}.video-item.done{border-color:rgba(48,210,135,.38)}.video-item b{font-size:13px;color:#edf7ff;word-break:break-all}.video-item span{font-size:12px;color:var(--muted);word-break:break-all}.current-video{display:grid;gap:8px;padding:12px 14px;border-radius:18px;background:rgba(86,168,255,.12);border:1px solid rgba(86,168,255,.24);margin-bottom:14px}.current-video b{word-break:break-all}.label-config{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.label-config .field{grid-column:span 6}.label-config .field.sm{grid-column:span 3}.label-config .field.full{grid-column:1/-1}.quick-help{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}.quick-help div{padding:10px;border-radius:14px;background:rgba(0,0,0,.18);border:1px solid var(--line);font-size:12px;color:var(--muted)}.quick-help b{display:block;color:#e6f2ff;margin-bottom:3px}@media(max-width:1100px){.label-workspace{grid-template-columns:1fr}.quick-help{grid-template-columns:repeat(2,1fr)}}@media(max-width:980px){.hero,.layout{grid-template-columns:1fr}.side{position:static}.field,.field.sm,.label-config .field,.label-config .field.sm{grid-column:1/-1}h1{font-size:32px}}.label-studio{margin-top:18px}.label-studio[hidden]{display:none}.label-stage{position:relative;background:#030813;border:1px solid var(--line);border-radius:20px;overflow:hidden;min-height:300px;display:grid;place-items:center}.label-stage img{display:block;width:100%;max-height:650px;object-fit:contain;user-select:none}.label-stage canvas{position:absolute;inset:0;width:100%;height:100%;margin:0;border:0;background:transparent;touch-action:none;cursor:crosshair}.label-stage.empty-stage{color:var(--muted);padding:28px;text-align:center}.label-studio-grid{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px}.label-status{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.label-status span{padding:7px 10px;border-radius:999px;background:rgba(86,168,255,.12);border:1px solid rgba(86,168,255,.24);font-size:12px;color:#dcecff}.label-object-list{display:grid;gap:8px;max-height:360px;overflow:auto}.label-object{cursor:pointer;display:grid;grid-template-columns:28px minmax(0,1fr);gap:8px;align-items:center;padding:8px 11px;border:1px solid var(--line);border-radius:14px;background:rgba(5,12,24,.42);font-size:12px}.label-object-info{display:grid;gap:4px;min-width:0}.label-object-info b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.label-object.active{border-color:rgba(86,168,255,.8);background:rgba(86,168,255,.17)}.label-object.lost{border-color:rgba(255,102,120,.55);color:#ffd7dd}.label-object span{color:var(--muted)}.label-object-visibility{all:unset;cursor:pointer;width:28px;height:28px;display:grid;place-items:center;border-radius:8px;color:#cfe3fb}.label-object-visibility:hover{background:rgba(255,255,255,.12)}.label-object-visibility svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}.label-object-visibility.is-hidden{color:var(--muted)}.label-object-visibility.is-hidden svg{opacity:.58}.image-lightbox{position:fixed;z-index:1000;inset:0;padding:28px;display:grid;place-items:center;background:rgba(2,6,14,.9);backdrop-filter:blur(10px)}.image-lightbox[hidden]{display:none}.image-lightbox-content{position:relative;display:grid;gap:10px;max-width:min(1400px,100%);max-height:100%;width:max-content}.image-lightbox img{display:block;max-width:calc(100vw - 56px);max-height:calc(100vh - 110px);object-fit:contain;border-radius:14px;border:1px solid rgba(255,255,255,.2);box-shadow:0 24px 80px rgba(0,0,0,.5);background:#050b15}.image-lightbox-title{color:#dcecff;font-size:13px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 48px}.image-lightbox-close{all:unset;cursor:pointer;position:absolute;right:0;top:0;width:38px;height:38px;display:grid;place-items:center;border-radius:50%;background:rgba(3,8,19,.82);border:1px solid rgba(255,255,255,.23);color:#fff;font-size:27px;line-height:1;z-index:1}.image-lightbox-close:hover{background:rgba(255,102,120,.3)}.label-help{font-size:12px;color:var(--muted);line-height:1.65;margin-top:12px}@media(max-width:980px){.label-studio-grid{grid-template-columns:1fr}}
+.label-pose-tools{display:grid;gap:10px;margin-top:12px;padding:12px;border:1px solid rgba(86,168,255,.3);border-radius:14px;background:rgba(86,168,255,.08)}.label-pose-tools[hidden],.label-pose-field[hidden]{display:none}#label-pose-prompt{color:#dcecff;font-size:13px}
 .label-timeline{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center;margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:14px;background:rgba(5,12,24,.42)}.label-timeline label{margin:0;white-space:nowrap}.label-timeline input[type=range]{width:100%;padding:0;accent-color:var(--blue);cursor:ew-resize}.label-timeline input[type=range]:disabled{opacity:.45;cursor:not-allowed}.label-timeline span{color:var(--muted);font-size:12px;white-space:nowrap}
 .label-choice-dialog{position:fixed;z-index:1100;inset:0;display:grid;place-items:center;padding:22px;background:rgba(2,6,14,.78);backdrop-filter:blur(8px)}.label-choice-dialog[hidden]{display:none}.label-choice-content{width:min(440px,100%);padding:22px;border:1px solid rgba(255,255,255,.2);border-radius:20px;background:#101d33;box-shadow:0 24px 80px rgba(0,0,0,.55)}.label-choice-content h3{margin:0 0 7px;font-size:18px}.label-choice-content p{margin:0 0 16px;color:var(--muted);font-size:13px}.label-choice-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px}.label-choice-option{all:unset;cursor:pointer;display:flex;align-items:center;gap:10px;min-height:44px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.06);color:var(--text);font-weight:700}.label-choice-option:hover,.label-choice-option:focus-visible{border-color:rgba(86,168,255,.8);background:rgba(86,168,255,.2);outline:none}.label-choice-option-key{display:grid;place-items:center;flex:0 0 24px;width:24px;height:24px;border-radius:7px;background:rgba(86,168,255,.2);color:#dcecff;font-size:12px}.label-choice-cancel{width:100%;text-align:center}
 </style>
@@ -2181,12 +2617,17 @@ HTML_PAGE = r'''<!doctype html>
       <section id="tab-train" class="tab active card section">
         <h2>训练配置</h2><p class="hint">训练任务在当前 Linux 环境中执行。</p>
         <div class="grid">
-          <div class="field full"><label>训练任务</label><div class="choice"><label><input name="train_task" type="radio" value="detect"><span>目标检测（图片 + XML 标注）</span></label><label><input name="train_task" type="radio" value="classify"><span>图像分类（类别子文件夹）</span></label></div><div class="mini" id="train-task-hint">检测：Images Dir 与 Annotations Dir 一一对应；分类：Images Dir 下每个子文件夹即一个类别，例如 normal/、defect/。</div></div>
+          <div class="field full"><label>训练任务</label><div class="choice"><label><input name="train_task" type="radio" value="detect"><span>目标检测（图片 + XML 标注）</span></label><label><input name="train_task" type="radio" value="classify"><span>图像分类（类别子文件夹）</span></label><label><input name="train_task" type="radio" value="pose"><span>关键点姿态（图片 + YOLO pose txt）</span></label></div><div class="mini" id="train-task-hint">检测：Images Dir 与 Annotations Dir 一一对应；分类：Images Dir 下每个子文件夹即一个类别，例如 normal/、defect/。</div></div>
           <div class="field full"><label>Dataset Root / Output Root</label><input id="dataset_root"></div>
           <div class="field"><label>Images Dir</label><input id="train_images_dir" placeholder="例如 E:/dataset/images"></div>
-          <div class="field" id="annotations-field"><label>Annotations Dir</label><input id="train_annotations_dir" placeholder="例如 E:/dataset/annotations"></div>
+          <div class="field" id="annotations-field"><label id="annotations-label">Annotations Dir</label><input id="train_annotations_dir" placeholder="例如 E:/dataset/annotations"></div>
+          <div class="field sm pose-field" hidden><label>关键点数量</label><input id="kpt_count" type="number" min="1" step="1" inputmode="numeric"></div>
+          <div class="field pose-field" hidden><label>flip_idx（左右翻转对应）</label><input id="flip_idx" placeholder="例如 1,0,3,2,4,5；留空关闭翻转增强"></div>
+          <div class="field pose-field" hidden><label>类别名称（可选）</label><input id="pose_classes" placeholder="逗号分隔；留空读取标注目录 classes.txt"></div>
+          <div class="field pose-field" hidden><label>OKS sigmas（可选）</label><input id="kpt_sigmas" placeholder="每个关键点一个，逗号分隔；留空用默认值"></div>
           <div class="field full"><label>训练集 / 验证集比例：<span id="split_ratio_text">训练 80% / 验证 20%</span></label><input id="train_ratio_percent" type="range" min="1" max="100" step="1"><div class="mini">拖动条表示训练集占比，验证集占比自动为剩余比例；建议常用 80% / 20%。</div></div>
           <div class="field full"><label>数据划分方式</label><select id="split_mode"><option value="video_group">按视频源分组（推荐）</option><option value="random">逐图片随机</option></select><div class="mini" id="split-mode-hint">视频分组会把“视频前缀_000015.jpg”末尾的帧号去掉，并保证同一视频只进入训练集或验证集；独立图片集才使用逐图片随机。</div></div>
+          <div class="field full"><label>固定验证集视频前缀（可选）</label><input id="val_groups" placeholder="例如 zone_20260930_011605,zone_20260930_205026"><div class="mini">逗号分隔；填写后这些视频固定进验证集、其余全部进训练集，多轮训练的指标才能直接对比。留空则自动挑选。</div></div>
           <div class="field"><label>Base Model</label><input id="base_model"></div>
 
           <div class="field"><label>Conda Env</label><input id="conda_env"></div>
@@ -2237,6 +2678,8 @@ HTML_PAGE = r'''<!doctype html>
             <div class="metrics-grid loss-grid">
               <div id="loss-item"><span id="loss-label">loss</span><b id="loss-value">-</b></div>
               <div id="box-loss-item"><span>box</span><b id="box-loss">-</b></div>
+              <div id="pose-loss-item" hidden><span>pose</span><b id="pose-loss">-</b></div>
+              <div id="kobj-loss-item" hidden><span>kobj</span><b id="kobj-loss">-</b></div>
               <div id="cls-loss-item"><span>cls</span><b id="cls-loss">-</b></div>
               <div id="dfl-loss-item"><span>dfl</span><b id="dfl-loss">-</b></div>
             </div>
@@ -2249,6 +2692,8 @@ HTML_PAGE = r'''<!doctype html>
               <div><span>Recall</span><b id="recall-text">-</b></div>
               <div><span>mAP50</span><b id="map50-text">-</b></div>
               <div><span>mAP50-95</span><b id="map5095-text">-</b></div>
+              <div class="pose-metric" hidden><span>Pose mAP50</span><b id="pose-map50-text">-</b></div>
+              <div class="pose-metric" hidden><span>Pose mAP50-95</span><b id="pose-map5095-text">-</b></div>
             </div>
             <div id="classify-metrics" class="metrics-grid loss-grid" hidden>
               <div><span>Top-1 Accuracy</span><b id="top1-text">-</b></div>
@@ -2310,6 +2755,10 @@ HTML_PAGE = r'''<!doctype html>
         <h2>自动跟踪标注</h2><p class="hint">支持连续视频或按文件名排序的图片集（适用于自行提取、筛选的视频帧）。图片集模式直接为原图生成同名 XML，不会复制或重编码图片；应保持图片顺序与视频时间顺序一致。</p>
         <div class="grid">
           <div class="field full"><label>标注来源</label><div class="choice"><label><input name="label_source_type" type="radio" value="video"><span>视频</span></label><label><input name="label_source_type" type="radio" value="camera"><span>摄像头</span></label><label><input name="label_source_type" type="radio" value="images"><span>图片集</span></label></div></div>
+          <div class="field full"><label>标注任务</label><div class="choice"><label><input name="label_task" type="radio" value="detect"><span>检测框（VOC XML）</span></label><label><input name="label_task" type="radio" value="pose"><span>关键点 Pose（YOLO pose txt）</span></label></div></div>
+          <div class="field sm label-pose-field"><label>Keypoints</label><input id="label_kpt_count" placeholder="6"></div>
+          <div class="field label-pose-field" style="grid-column:span 9"><label>Keypoint Names（按标注顺序）</label><input id="label_kpt_names" placeholder="entry_left,entry_right,inner_right,inner_left,divider_entry,divider_inner"></div>
+          <div class="field full label-pose-field"><p class="hint" style="margin:0">Pose 模式：每个目标按顺序点击全部关键点，点击 Shift+鼠标 记为遮挡（v=1），看不到的点按“跳过此点”（v=0）。框由关键点自动外扩生成，也可用“修正选中框”手动重画。Annotations Dir 中会输出同名 .txt 和 classes.txt，可直接作为训练页的 Pose Labels Dir。</p></div>
         </div>
         <div id="label-video-source" class="label-source">
           <div class="grid">
@@ -2387,7 +2836,8 @@ HTML_PAGE = r'''<!doctype html>
               <div id="label-stage" class="label-stage empty-stage"><span>选择来源并点击“在网页中开始标注”后，此处显示实时画面。</span><img id="label-frame-image" hidden draggable="false" alt="当前标注画面"><canvas id="label-frame-canvas" hidden></canvas></div>
               <div class="label-timeline"><label for="label-frame-seek">视频位置</label><input id="label-frame-seek" type="range" min="0" max="0" value="0" disabled aria-label="拖动选择视频帧"><span id="label-frame-seek-value">帧 -</span></div>
               <div id="label-session-status" class="label-status"></div>
-              <div class="actions"><div class="btns"><button class="btn green" id="label-play-button" onclick="toggleBrowserLabelPlay()">播放跟踪</button><button class="btn" onclick="advanceBrowserLabelFrame()">下一帧</button><button class="btn" onclick="saveBrowserLabelFrame()">保存当前帧</button></div><div class="btns"><button class="btn" onclick="setLabelDrawMode('add')">添加框</button><button class="btn" onclick="setLabelDrawMode('edit')">修正选中框</button><button class="btn" onclick="setLabelDrawMode('sample')">追加选中目标视角</button><button class="btn red" onclick="deleteBrowserLabelObject()">删除选中框</button></div></div>
+              <div class="actions"><div class="btns"><button class="btn green" id="label-play-button" onclick="toggleBrowserLabelPlay()">播放跟踪</button><button class="btn" onclick="advanceBrowserLabelFrame()">下一帧</button><button class="btn" onclick="saveBrowserLabelFrame()">保存当前帧</button><button class="btn" id="label-undo-button" onclick="undoBrowserLabelSave()" title="删除最近一次保存的图片和标注，回到那一帧修正后重新保存（Ctrl+Z）" disabled>回退上次保存</button></div><div class="btns"><button class="btn" onclick="setLabelDrawMode('add')">添加框</button><button class="btn" onclick="setLabelDrawMode('edit')">修正选中框</button><button class="btn" onclick="setLabelDrawMode('sample')">追加选中目标视角</button><button class="btn red" onclick="deleteBrowserLabelObject()">删除选中框</button></div></div>
+              <div id="label-pose-tools" class="label-pose-tools" hidden><span id="label-pose-prompt" class="count">点击“添加关键点目标”开始。</span><div class="btns"><button class="btn blue" onclick="beginPoseCollect()">添加关键点目标</button><button class="btn" onclick="beginPoseCollect(true)">重标选中目标关键点</button><button class="btn" onclick="skipPosePoint()">跳过此点 (S)</button><button class="btn" onclick="undoPosePoint()">撤销上一点 (⌫)</button><button class="btn" onclick="cancelPoseCollect()">取消 (Esc)</button></div><div class="label-help" style="margin-top:0">空闲时可直接拖动已有关键点微调；Shift+单击已有关键点可在“可见/遮挡”之间切换。播放跟踪时关键点随框平移缩放，仅为近似，保存前请检查并拖动修正。</div></div>
               <div class="label-help">多角度模式：选择 Multi-template，暂停到新角度后选中目标，点击“追加选中目标视角”并重画该目标。它会保留已有参考图；“修正选中框”会重置参考图。</div>
             </div>
             <div class="panel"><h3>当前目标</h3><div id="label-object-list" class="label-object-list"><div class="empty">尚未框选目标。</div></div></div>
@@ -2419,7 +2869,7 @@ HTML_PAGE = r'''<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','train_ratio_percent','split_mode','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','rknn_onnx','rknn_classes','rknn_python','rknn_mode','rknn_calibration_dir','rknn_calibration_count','rknn_test_image','rknn_conf','rknn_iou','rknn_output_dir','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
+const fields=['dataset_root','train_task','train_images_dir','train_annotations_dir','kpt_count','flip_idx','kpt_sigmas','pose_classes','train_ratio_percent','split_mode','val_groups','img_width','img_height','image_resize_mode','epochs','batch','lr0','conda_env','base_model','torch_cuda','train_cache','project_name','model_name','test_model','test_image_file','test_image_folder','test_output_dir','camera_index','conf','rknn_onnx','rknn_classes','rknn_python','rknn_mode','rknn_calibration_dir','rknn_calibration_count','rknn_test_image','rknn_conf','rknn_iou','rknn_output_dir','label_video_dir','label_video','label_camera_index','label_source_type','label_images_input_dir','label_name','label_kpt_count','label_kpt_names','label_interval','label_images_dir','label_annotations_dir','label_prefix','label_tracker','label_start_frame','label_max_frames','label_display_scale','label_jpeg_quality'];
 
 
 
@@ -2451,18 +2901,20 @@ function updateSplitRatio(){const el=document.getElementById('train_ratio_percen
 function fmt(v,d=3){return v===null||v===undefined||v===''||Number.isNaN(Number(v))?'-':Number(v).toFixed(d).replace(/\.0+$/,'').replace(/(\.\d*?)0+$/,'$1')}
 function setText(id,value){const el=document.getElementById(id); if(el) el.textContent=value}
 function drawChart(id,history,series){const canvas=document.getElementById(id); if(!canvas) return; const ctx=canvas.getContext('2d'); const w=canvas.width,h=canvas.height; ctx.clearRect(0,0,w,h); ctx.fillStyle='rgba(3,8,19,.72)'; ctx.fillRect(0,0,w,h); const rows=(history||[]).filter(x=>series.some(s=>x[s.key]!==null&&x[s.key]!==undefined)); ctx.strokeStyle='rgba(255,255,255,.09)'; ctx.lineWidth=1; for(let i=1;i<4;i++){const y=i*h/4; ctx.beginPath(); ctx.moveTo(34,y); ctx.lineTo(w-10,y); ctx.stroke()} if(rows.length<2){ctx.fillStyle='rgba(159,176,199,.9)'; ctx.font='13px sans-serif'; ctx.fillText('等待更多 epoch 数据...',18,34); return} let vals=[]; for(const r of rows){for(const s of series){const v=Number(r[s.key]); if(Number.isFinite(v)) vals.push(v)}} let min=Math.min(...vals),max=Math.max(...vals); if(min===max){min-=1;max+=1} const pad=(max-min)*0.08; min-=pad; max+=pad; const xOf=i=>34+i*(w-48)/Math.max(1,rows.length-1); const yOf=v=>h-22-(Number(v)-min)*(h-42)/(max-min); ctx.font='11px sans-serif'; series.forEach((s,si)=>{ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.beginPath(); let started=false; rows.forEach((r,i)=>{const v=Number(r[s.key]); if(!Number.isFinite(v)) return; const x=xOf(i),y=yOf(v); if(!started){ctx.moveTo(x,y); started=true}else ctx.lineTo(x,y)}); ctx.stroke(); ctx.fillStyle=s.color; ctx.fillText(s.label,38+si*82,16)}); ctx.fillStyle='rgba(159,176,199,.8)'; ctx.fillText(`E${rows[0].epoch}`,34,h-7); ctx.fillText(`E${rows[rows.length-1].epoch}`,w-52,h-7)}
-function updateTrainProgress(p){p=p||{}; const task=p.task||document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const pct=Math.max(0,Math.min(100,Number(p.percent||0))); const totalEpochs=Number(p.total_epochs||0); const epoch=Number(p.epoch||0); const totalBatches=Number(p.total_batches||0); const batch=Number(p.batch||0); const phaseMap={idle:'等待开始',pending:'准备训练',train:'训练中',val:'验证中',metrics:'指标已更新',export:'正在停止训练并导出'}; setText('train-phase',`${phaseMap[p.phase]||p.phase||'等待开始'}${p.updated_at?' · '+p.updated_at:''}`); const bar=document.getElementById('epoch-bar'); if(bar) bar.style.width=pct+'%'; setText('epoch-text',epoch&&totalEpochs?`${epoch}/${totalEpochs}`:'-'); setText('batch-text',totalBatches?`${batch}/${totalBatches} (${fmt(pct,1)}%)`:'-'); setText('gpu-text',p.gpu_mem||'-'); setText('speed-text',p.speed||'-'); setText('elapsed-text',p.elapsed||'-'); setText('eta-text',p.eta||'-'); const lossItem=document.getElementById('loss-item'); const boxItem=document.getElementById('box-loss-item'); const clsItem=document.getElementById('cls-loss-item'); const dflItem=document.getElementById('dfl-loss-item'); if(lossItem) lossItem.hidden=!classify; if(boxItem) boxItem.hidden=classify; if(clsItem) clsItem.hidden=classify; if(dflItem) dflItem.hidden=classify; setText('loss-title',classify?'分类训练损失':'检测训练损失'); setText('loss-value',fmt(p.loss)); setText('box-loss',fmt(p.box_loss)); setText('cls-loss',fmt(p.cls_loss)); setText('dfl-loss',fmt(p.dfl_loss)); const detectMetrics=document.getElementById('detect-metrics'); const classifyMetrics=document.getElementById('classify-metrics'); if(detectMetrics) detectMetrics.hidden=classify; if(classifyMetrics) classifyMetrics.hidden=!classify; const m=p.metrics||{}; setText('val-text',p.val_total?`${p.val_batch||0}/${p.val_total} (${fmt(p.val_percent||0,1)}%)`:'-'); setText('precision-text',fmt(m.precision)); setText('recall-text',fmt(m.recall)); setText('map50-text',fmt(m.map50)); setText('map5095-text',fmt(m.map50_95)); setText('top1-text',fmt(m.top1_acc)); setText('top5-text',fmt(m.top5_acc)); const lossSeries=classify?[{key:'loss',label:'loss',color:'#ffbd5a'}]:[{key:'box_loss',label:'box',color:'#56a8ff'},{key:'cls_loss',label:'cls',color:'#ffbd5a'},{key:'dfl_loss',label:'dfl',color:'#a78bfa'}]; const metricSeries=classify?[{key:'top1_acc',label:'Top-1',color:'#30d287'},{key:'top5_acc',label:'Top-5',color:'#56a8ff'}]:[{key:'precision',label:'P',color:'#30d287'},{key:'recall',label:'R',color:'#56a8ff'},{key:'map50',label:'mAP50',color:'#ffbd5a'},{key:'map50_95',label:'mAP50-95',color:'#a78bfa'}]; drawChart('loss-chart',p.history||[],lossSeries); drawChart('metric-chart',p.history||[],metricSeries)}
+function updateTrainProgress(p){p=p||{}; const task=p.task||document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const pose=task==='pose'; const pct=Math.max(0,Math.min(100,Number(p.percent||0))); const totalEpochs=Number(p.total_epochs||0); const epoch=Number(p.epoch||0); const totalBatches=Number(p.total_batches||0); const batch=Number(p.batch||0); const phaseMap={idle:'等待开始',pending:'准备训练',train:'训练中',val:'验证中',metrics:'指标已更新',export:'正在停止训练并导出'}; setText('train-phase',`${phaseMap[p.phase]||p.phase||'等待开始'}${p.updated_at?' · '+p.updated_at:''}`); const bar=document.getElementById('epoch-bar'); if(bar) bar.style.width=pct+'%'; setText('epoch-text',epoch&&totalEpochs?`${epoch}/${totalEpochs}`:'-'); setText('batch-text',totalBatches?`${batch}/${totalBatches} (${fmt(pct,1)}%)`:'-'); setText('gpu-text',p.gpu_mem||'-'); setText('speed-text',p.speed||'-'); setText('elapsed-text',p.elapsed||'-'); setText('eta-text',p.eta||'-'); const lossItem=document.getElementById('loss-item'); const boxItem=document.getElementById('box-loss-item'); const clsItem=document.getElementById('cls-loss-item'); const dflItem=document.getElementById('dfl-loss-item'); if(lossItem) lossItem.hidden=!classify; if(boxItem) boxItem.hidden=classify; if(clsItem) clsItem.hidden=classify; if(dflItem) dflItem.hidden=classify; for(const id of ['pose-loss-item','kobj-loss-item']){const el=document.getElementById(id); if(el) el.hidden=!pose} document.querySelectorAll('.pose-metric').forEach(el=>el.hidden=!pose); setText('pose-loss',fmt(p.pose_loss)); setText('kobj-loss',fmt(p.kobj_loss)); setText('loss-title',classify?'分类训练损失':(pose?'姿态训练损失':'检测训练损失')); setText('loss-value',fmt(p.loss)); setText('box-loss',fmt(p.box_loss)); setText('cls-loss',fmt(p.cls_loss)); setText('dfl-loss',fmt(p.dfl_loss)); const detectMetrics=document.getElementById('detect-metrics'); const classifyMetrics=document.getElementById('classify-metrics'); if(detectMetrics) detectMetrics.hidden=classify; if(classifyMetrics) classifyMetrics.hidden=!classify; const m=p.metrics||{}; setText('val-text',p.val_total?`${p.val_batch||0}/${p.val_total} (${fmt(p.val_percent||0,1)}%)`:'-'); setText('precision-text',fmt(m.precision)); setText('recall-text',fmt(m.recall)); setText('map50-text',fmt(m.map50)); setText('map5095-text',fmt(m.map50_95)); setText('pose-map50-text',fmt(m.pose_map50)); setText('pose-map5095-text',fmt(m.pose_map50_95)); setText('top1-text',fmt(m.top1_acc)); setText('top5-text',fmt(m.top5_acc)); const lossSeries=classify?[{key:'loss',label:'loss',color:'#ffbd5a'}]:[{key:'box_loss',label:'box',color:'#56a8ff'},...(pose?[{key:'pose_loss',label:'pose',color:'#f472b6'},{key:'kobj_loss',label:'kobj',color:'#94a3b8'}]:[]),{key:'cls_loss',label:'cls',color:'#ffbd5a'},{key:'dfl_loss',label:'dfl',color:'#a78bfa'}]; const metricSeries=classify?[{key:'top1_acc',label:'Top-1',color:'#30d287'},{key:'top5_acc',label:'Top-5',color:'#56a8ff'}]:[{key:'precision',label:'P',color:'#30d287'},{key:'recall',label:'R',color:'#56a8ff'},{key:'map50',label:'mAP50',color:'#ffbd5a'},{key:'map50_95',label:'mAP50-95',color:'#a78bfa'},...(pose?[{key:'pose_map50_95',label:'Pose mAP50-95',color:'#f472b6'}]:[])]; drawChart('loss-chart',p.history||[],lossSeries); drawChart('metric-chart',p.history||[],metricSeries)}
 function updateRknnProgress(p,markers){p=p||{}; markers=markers||{}; const mode=document.getElementById('rknn_mode')?.value||'both'; const sequences={fp:['check_environment','check_onnx','build_fp','package','complete'],int8:['check_environment','check_onnx','build_int8','package','complete'],both:['check_environment','check_onnx','build_fp','build_int8','package','complete']}; const sequence=sequences[mode]||sequences.both; const current=sequence.indexOf(p.stage); document.querySelectorAll('.rknn-stage').forEach(el=>{const index=sequence.indexOf(el.dataset.stage); el.classList.toggle('active',el.dataset.stage===p.stage); el.classList.toggle('done',index>=0&&current>=0&&index<current); el.classList.toggle('skipped',index<0)}); setText('rknn-progress-message',`${p.message||'等待开始'}${p.updated_at?' · '+p.updated_at:''}`); setText('rknn-progress-percent',`${Math.max(0,Math.min(100,Number(p.percent||0)))}%`); const artifactLabels={rknn_model_fp:'FP 模型',rknn_model_int8:'INT8 模型',rknn_package:'部署包',rknn_manifest:'清单'}; const list=document.getElementById('rknn-artifact-list'); const box=document.getElementById('rknn-artifacts'); const items=Object.entries(artifactLabels).filter(([key])=>markers[key]); if(list){list.innerHTML=''; items.forEach(([key,label])=>{const row=document.createElement('div'); row.className='rknn-artifact'; const name=document.createElement('span'); name.textContent=label; const path=document.createElement('b'); path.textContent=markers[key]; row.append(name,path); list.appendChild(row)})} if(box) box.hidden=!items.length; const download=document.getElementById('rknn-download-button'); if(download) download.disabled=!markers.rknn_package; if(p.error){showRknnCheck(p.partial_success?'error':'error',p.partial_success?`非量化模型可用，INT8 失败：${p.error}`:p.error)}}
-function updateTrainTaskUI(){const task=document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const annotations=document.getElementById('annotations-field'); const hint=document.getElementById('train-task-hint'); const splitMode=document.getElementById('split_mode'); const splitHint=document.getElementById('split-mode-hint'); if(annotations) annotations.hidden=classify; if(splitMode) splitMode.disabled=classify; if(splitHint) splitHint.textContent=classify?'分类任务按每个类别内部随机划分，此选项仅用于目标检测。':'视频分组会把“视频前缀_000015.jpg”末尾的帧号去掉，并保证同一视频只进入训练集或验证集；独立图片集才使用逐图片随机。'; if(hint) hint.textContent=classify?'分类数据集结构：Images Dir/类别名/图片。每个类别至少 2 张图片；Annotations Dir 不参与分类训练；Base Model 请使用分类权重，例如 yolo11n-cls.pt。':'检测数据集结构：Images Dir 与 Annotations Dir 中的同名图片、XML 一一对应。'}
+function updateTrainTaskUI(){const task=document.querySelector('input[name="train_task"]:checked')?.value||'detect'; const classify=task==='classify'; const pose=task==='pose'; document.querySelectorAll('.pose-field').forEach(el=>el.hidden=!pose); const annLabel=document.getElementById('annotations-label'); if(annLabel) annLabel.textContent=pose?'Pose Labels Dir（YOLO pose txt）':'Annotations Dir'; const annotations=document.getElementById('annotations-field'); const hint=document.getElementById('train-task-hint'); const splitMode=document.getElementById('split_mode'); const splitHint=document.getElementById('split-mode-hint'); if(annotations) annotations.hidden=classify; if(splitMode) splitMode.disabled=classify; if(splitHint) splitHint.textContent=classify?'分类任务按每个类别内部随机划分，此选项仅用于目标检测。':'视频分组会把“视频前缀_000015.jpg”末尾的帧号去掉，并保证同一视频只进入训练集或验证集；独立图片集才使用逐图片随机。'; if(hint) hint.textContent=pose?'姿态数据集结构：Images Dir 中的图片与 Labels Dir 中的同名 .txt 一一对应，每行 cls cx cy w h x1 y1 v1 ... xk yk vk（相对原图归一化，v=0 不可见/1 遮挡/2 可见）。Base Model 请使用姿态权重，例如 yolov8n-pose.pt。':classify?'分类数据集结构：Images Dir/类别名/图片。每个类别至少 2 张图片；Annotations Dir 不参与分类训练；Base Model 请使用分类权重，例如 yolo11n-cls.pt。':'检测数据集结构：Images Dir 与 Annotations Dir 中的同名图片、XML 一一对应。'}
 function updateRknnModeUI(){const mode=document.getElementById('rknn_mode')?.value||'both'; document.querySelectorAll('.rknn-calibration').forEach(el=>el.hidden=mode==='fp'); const count=Number(document.getElementById('rknn_calibration_count')?.value||0); setText('rknn-calibration-warning',mode!=='fp'&&count>0&&count<100?'少于 100 张可能增大量化精度损失。':'')}
 function syncLabelFields(prefix,toCanonical){const pairs=prefix==='camera'?[['label_name_camera','label_name'],['label_prefix_camera','label_prefix'],['label_images_dir_camera','label_images_dir'],['label_annotations_dir_camera','label_annotations_dir'],['label_tracker_camera','label_tracker'],['label_interval_camera','label_interval'],['label_max_frames_camera','label_max_frames'],['label_display_scale_camera','label_display_scale'],['label_jpeg_quality_camera','label_jpeg_quality']]:[['label_name_images','label_name'],['label_annotations_dir_images','label_annotations_dir'],['label_tracker_images','label_tracker'],['label_interval_images','label_interval'],['label_start_frame_images','label_start_frame'],['label_max_frames_images','label_max_frames'],['label_display_scale_images','label_display_scale']]; for(const [sourceId,canonicalId] of pairs){const from=document.getElementById(toCanonical?sourceId:canonicalId); const to=document.getElementById(toCanonical?canonicalId:sourceId); if(from&&to) to.value=from.value}}
 function updateLabelSourceUI(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; const video=document.getElementById('label-video-source'); const camera=document.getElementById('label-camera-source'); const images=document.getElementById('label-images-source'); const start=document.getElementById('label-start-button'); if(video) video.hidden=source!=='video'; if(camera) camera.hidden=source!=='camera'; if(images) images.hidden=source!=='images'; if(source==='camera') syncLabelFields('camera',false); if(source==='images') syncLabelFields('images',false); if(start) start.textContent=source==='camera'?'在网页中开始摄像头标注':source==='images'?'在网页中开始图片集标注':'在网页中开始视频标注'}
-function collect(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; if(source==='camera') syncLabelFields('camera',true); if(source==='images') syncLabelFields('images',true); for(const id of fields){const el=document.getElementById(id); if(el) values[id]=el.value} for(const n of ['train_device','train_task','test_source','label_source_type']){const el=document.querySelector(`input[name="${n}"]:checked`); if(el) values[n]=el.value} return values}
+const LABEL_TASK_FIELDS=['name','images_dir','annotations_dir']; let currentLabelTask=null;
+function switchLabelTask(){const task=document.querySelector('input[name="label_task"]:checked')?.value||'detect'; if(currentLabelTask&&currentLabelTask!==task){collect(); currentLabelTask=task; for(const f of LABEL_TASK_FIELDS){const saved=values[`label_${task}_${f}`]; const el=document.getElementById(`label_${f}`); if(saved&&el) el.value=saved} syncLabelFields('camera',false); syncLabelFields('images',false)} currentLabelTask=task}
+function collect(){const source=document.querySelector('input[name="label_source_type"]:checked')?.value||'video'; if(source==='camera') syncLabelFields('camera',true); if(source==='images') syncLabelFields('images',true); for(const id of fields){const el=document.getElementById(id); if(el) values[id]=el.value} for(const n of ['train_device','train_task','test_source','label_source_type','label_task']){const el=document.querySelector(`input[name="${n}"]:checked`); if(el) values[n]=el.value} if(currentLabelTask){for(const f of LABEL_TASK_FIELDS) values[`label_${currentLabelTask}_${f}`]=values[`label_${f}`]} return values}
 function resourceEstimateKey(v){return [v.train_task||'detect',v.train_images_dir||'',v.base_model||'',v.img_width||'',v.img_height||'',v.image_resize_mode||'',v.batch||'',v.train_cache||'',v.train_device||''].join('|')}
 function showResourceEstimate(e){e=e||{}; setText('estimate-images',e.image_count!==undefined?`${e.image_count} 张`:'-'); setText('estimate-ram',e.ram_text||'-'); setText('estimate-vram',e.vram_text||'-'); setText('estimate-cache',e.cache_text||'-'); setText('estimate-imgsz',e.img_size||'-'); setText('estimate-batch',e.batch||'-'); const riskMap={safe:'资源预估',warning:'资源预估 · 警告',danger:'资源预估 · 风险'}; const model=e.model_size?` · YOLO-${e.model_size}`:''; setText('resource-note',`${riskMap[e.risk]||'资源预估'}${model} · cache=${e.cache_mode||'-'}`); setText('resource-detail',e.note||'估算值仅供参考，实际峰值会随模型、增强策略、驱动和环境波动。')}
 async function updateResourceEstimate(){try{const v=collect(); const key=resourceEstimateKey(v); if(key===lastResourceEstimateKey) return; lastResourceEstimateKey=key; setText('resource-note','正在估算...'); const j=await api('/api/train-estimate',{values:v}); showResourceEstimate(j.estimate||{})}catch(e){setText('resource-note','估算失败'); setText('resource-detail',e.message)}}
 function scheduleResourceEstimate(){clearTimeout(resourceEstimateTimer); resourceEstimateTimer=setTimeout(updateResourceEstimate,450)}
-function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); for(const n of ['train_device','train_task','test_source','label_source_type']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateRknnModeUI(); updateLabelSourceUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
+function apply(v){values={...values,...v}; for(const id of fields){const el=document.getElementById(id); if(el && values[id]!==undefined && el.value!==String(values[id])) el.value=values[id]} updateSplitRatio(); for(const n of ['train_device','train_task','test_source','label_source_type','label_task']){if(values[n]!==undefined){const el=document.querySelector(`input[name="${n}"][value="${values[n]}"]`); if(el) el.checked=true}} updateTrainTaskUI(); updateRknnModeUI(); currentLabelTask=values.label_task||'detect'; updateLabelSourceUI(); updateLabelTaskUI(); updateCurrentVideo(); updateCommands(); scheduleResourceEstimate()}
 
 
 async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); const j=await r.json(); if(!r.ok||j.error) throw new Error(j.error||r.statusText); return j}
@@ -2513,27 +2965,47 @@ function labelFrameUrl(){return `/api/label-session/frame?session_id=${encodeURI
 function labelPalette(i){return ['#50dc78','#50b4ff','#e678ff','#ffbe46','#78dcff','#b4a0ff','#78ffd2','#ff8c8c'][i%8]}
 function showLabelStudio(show){const studio=document.getElementById('label-browser-studio'); if(studio) studio.hidden=!show}
 function eyeIcon(hidden){return hidden?'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18"></path><path d="M10.6 6.2A10.8 10.8 0 0 1 12 6c5.5 0 9.3 6 9.3 6a17.8 17.8 0 0 1-3.1 3.8M6.2 6.2A17.6 17.6 0 0 0 2.7 12S6.5 18 12 18c.8 0 1.6-.1 2.4-.4"></path><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"></path></svg>':'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.7 12S6.5 6 12 6s9.3 6 9.3 6-3.8 6-9.3 6S2.7 12 2.7 12Z"></path><circle cx="12" cy="12" r="3"></circle></svg>'}
-function renderLabelSession(){const state=labelSessionState; const status=document.getElementById('label-session-status'); const list=document.getElementById('label-object-list'); const tip=document.getElementById('label-session-tip'); const seek=document.getElementById('label-frame-seek'); const seekValue=document.getElementById('label-frame-seek-value'); if(!state||!status||!list) return; if(seek){seek.disabled=state.source_type!=='video'||!state.frame_count; seek.max=String(Math.max(0,(state.frame_count||1)-1)); seek.value=String(state.frame_index||0)} if(seekValue) seekValue.textContent=`帧 ${state.frame_index}${state.frame_count?` / ${Math.max(0,state.frame_count-1)}`:''}`; status.innerHTML=`<span>来源：${state.source_type==='camera'?'摄像头':state.source_type==='images'?'图片集':'视频'}</span><span>帧：${state.frame_index}${state.frame_count?'/'+Math.max(0,state.frame_count-1):''}</span><span>已保存：${state.saved}</span><span>间隔：${state.interval}</span><span>目标：${state.objects.filter(x=>x.ok&&!x.hidden).length}/${state.objects.filter(x=>!x.hidden).length}</span>${state.ended?'<span>来源已结束</span>':''}${state.lost?'<span>跟踪丢失，请修正或删除</span>':''}`; if(tip) tip.textContent=state.lost?'跟踪丢失，已暂停播放；请选择目标后修正或删除。':'在画面上拖动鼠标绘制标注框。'; list.innerHTML=''; if(!state.objects.length){list.innerHTML='<div class="empty">尚未框选目标。点击“添加框”后在画面拖动鼠标。</div>'} else {state.objects.forEach((obj,index)=>{const hidden=Boolean(obj.hidden)||labelHiddenObjectIds.has(obj.id); const item=document.createElement('div'); item.className='label-object'+(obj.id===labelActiveObjectId?' active':'')+(!obj.ok?' lost':''); item.innerHTML=`<button class="label-object-visibility${hidden?' is-hidden':''}" type="button" title="${hidden?'显示':'隐藏'} #${obj.id} ${obj.label} 的框" aria-label="${hidden?'显示':'隐藏'} #${obj.id} ${obj.label} 的框">${eyeIcon(hidden)}</button><div class="label-object-info"><b>#${obj.id} ${obj.label}${obj.ok?'':' · 已丢失'}</b><span>${obj.w} × ${obj.h} · 参考视角 ${obj.sample_count||1}</span></div>`; item.onclick=()=>{labelActiveObjectId=obj.id; renderLabelSession(); drawLabelCanvas()}; item.querySelector('.label-object-visibility').onclick=async event=>{event.stopPropagation(); const nextHidden=!hidden; try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:'visibility',object_id:obj.id,hidden:nextHidden}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(nextHidden) labelHiddenObjectIds.add(obj.id); else labelHiddenObjectIds.delete(obj.id); renderLabelSession()}catch(e){toast(e.message)}}; list.appendChild(item)})} const button=document.getElementById('label-play-button'); if(button) button.textContent=labelPlaying?'暂停跟踪':'播放跟踪'; drawLabelCanvas()}
+function renderLabelSession(){const state=labelSessionState; const status=document.getElementById('label-session-status'); const list=document.getElementById('label-object-list'); const tip=document.getElementById('label-session-tip'); const seek=document.getElementById('label-frame-seek'); const seekValue=document.getElementById('label-frame-seek-value'); if(!state||!status||!list) return; if(seek){seek.disabled=state.source_type!=='video'||!state.frame_count; seek.max=String(Math.max(0,(state.frame_count||1)-1)); seek.value=String(state.frame_index||0)} if(seekValue) seekValue.textContent=`帧 ${state.frame_index}${state.frame_count?` / ${Math.max(0,state.frame_count-1)}`:''}`; status.innerHTML=`<span>来源：${state.source_type==='camera'?'摄像头':state.source_type==='images'?'图片集':'视频'}</span><span>帧：${state.frame_index}${state.frame_count?'/'+Math.max(0,state.frame_count-1):''}</span><span>已保存：${state.saved}</span>${state.undo_count?`<span>可回退：${state.undo_count} 次（上次第 ${state.undo_frame} 帧）</span>`:''}<span>间隔：${state.interval}</span><span>目标：${state.objects.filter(x=>x.ok&&!x.hidden).length}/${state.objects.filter(x=>!x.hidden).length}</span>${state.ended?'<span>来源已结束</span>':''}${state.lost?'<span>跟踪丢失，请修正或删除</span>':''}${state.track_warning?'<span>已暂停：跟踪需确认</span>':''}`; if(tip) tip.textContent=state.track_warning?`${state.track_warning}（本帧未自动保存）`:state.lost?'跟踪丢失，已暂停播放；请选择目标后修正或删除。':state.task==='pose'?'Pose 模式：点击“添加关键点目标”后按顺序点击关键点。':'在画面上拖动鼠标绘制标注框。'; list.innerHTML=''; if(!state.objects.length){list.innerHTML='<div class="empty">尚未框选目标。点击“添加框”后在画面拖动鼠标。</div>'} else {state.objects.forEach((obj,index)=>{const hidden=Boolean(obj.hidden)||labelHiddenObjectIds.has(obj.id); const item=document.createElement('div'); item.className='label-object'+(obj.id===labelActiveObjectId?' active':'')+(!obj.ok?' lost':''); item.innerHTML=`<button class="label-object-visibility${hidden?' is-hidden':''}" type="button" title="${hidden?'显示':'隐藏'} #${obj.id} ${obj.label} 的框" aria-label="${hidden?'显示':'隐藏'} #${obj.id} ${obj.label} 的框">${eyeIcon(hidden)}</button><div class="label-object-info"><b>#${obj.id} ${obj.label}${obj.ok?'':' · 已丢失'}</b><span>${obj.w} × ${obj.h} · 参考视角 ${obj.sample_count||1}${state.task==='pose'?` · 关键点 ${(obj.keypoints||[]).filter(k=>k[2]>0).length}/${state.kpt_count}${obj.bbox_auto?' · 自动框':''}`:''}</span></div>`; item.onclick=()=>{labelActiveObjectId=obj.id; renderLabelSession(); drawLabelCanvas()}; item.querySelector('.label-object-visibility').onclick=async event=>{event.stopPropagation(); const nextHidden=!hidden; try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:'visibility',object_id:obj.id,hidden:nextHidden}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(nextHidden) labelHiddenObjectIds.add(obj.id); else labelHiddenObjectIds.delete(obj.id); renderLabelSession()}catch(e){toast(e.message)}}; list.appendChild(item)})} const button=document.getElementById('label-play-button'); if(button) button.textContent=labelPlaying?'暂停跟踪':'播放跟踪'; const undoButton=document.getElementById('label-undo-button'); if(undoButton){undoButton.disabled=!state.undo_count; undoButton.textContent=state.undo_count?`回退上次保存（第 ${state.undo_frame} 帧）`:'回退上次保存'} const poseTools=document.getElementById('label-pose-tools'); if(poseTools) poseTools.hidden=state.task!=='pose'; updatePosePrompt(); drawLabelCanvas()}
 
 function refreshLabelFrame(){const image=document.getElementById('label-frame-image'); const stage=document.getElementById('label-stage'); if(!image||!labelSessionId) return; image.hidden=false; stage?.classList.remove('empty-stage'); image.onload=()=>drawLabelCanvas(); image.src=labelFrameUrl()}
 function setupLabelTimeline(){const seek=document.getElementById('label-frame-seek'); const value=document.getElementById('label-frame-seek-value'); if(!seek||seek.dataset.ready) return; seek.dataset.ready='1'; seek.addEventListener('input',()=>{if(value) value.textContent=`帧 ${seek.value}${labelSessionState?.frame_count?` / ${Math.max(0,labelSessionState.frame_count-1)}`:''}`}); seek.addEventListener('change',()=>seekBrowserLabelFrame(Number(seek.value)))}
-function setupLabelCanvas(){const canvas=document.getElementById('label-frame-canvas'); if(!canvas||canvas.dataset.ready) return; canvas.dataset.ready='1'; canvas.hidden=false; canvas.addEventListener('pointerdown',event=>{if(!labelSessionState) return; const point=labelCanvasPoint(event); if(!point) return; labelDragStart=point; canvas.setPointerCapture(event.pointerId); drawLabelCanvas(point)}); canvas.addEventListener('pointermove',event=>{if(!labelDragStart) return; drawLabelCanvas(labelCanvasPoint(event))}); canvas.addEventListener('pointerup',async event=>{if(!labelDragStart) return; const end=labelCanvasPoint(event); const start=labelDragStart; labelDragStart=null; canvas.releasePointerCapture(event.pointerId); drawLabelCanvas(); if(!end) return; const x=Math.min(start.x,end.x),y=Math.min(start.y,end.y),w=Math.abs(end.x-start.x),h=Math.abs(end.y-start.y); if(w<5||h<5){toast('标注框过小');return} const action=labelDrawMode==='edit'?'update':labelDrawMode==='sample'?'add_sample':'add'; if(action==='add_sample'&&!labelActiveObjectId){toast('请先在右侧选择要追加视角的目标');return} let label=''; if(action==='add'){label=await chooseBrowserLabel(); if(!label) return} try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action,object_id:labelActiveObjectId,bbox:{x,y,w,h},label}); labelSessionState=j.state; if(action==='add') labelActiveObjectId=labelSessionState.objects.at(-1)?.id||null; renderLabelSession()}catch(e){toast(e.message)}}); window.addEventListener('resize',()=>drawLabelCanvas())}
+function setupLabelCanvas(){const canvas=document.getElementById('label-frame-canvas'); if(!canvas||canvas.dataset.ready) return; canvas.dataset.ready='1'; canvas.hidden=false; canvas.addEventListener('pointerdown',event=>{if(!labelSessionState) return; const point=labelCanvasPoint(event); if(!point) return; if(labelSessionState.task==='pose'&&poseHandlePointerDown(event,point,canvas)) return; labelDragStart=point; canvas.setPointerCapture(event.pointerId); drawLabelCanvas(point)}); canvas.addEventListener('pointermove',event=>{if(labelKptDrag){const p=labelCanvasPoint(event); if(p){labelKptDrag.point=p; drawLabelCanvas()} return} if(!labelDragStart) return; drawLabelCanvas(labelCanvasPoint(event))}); canvas.addEventListener('pointerup',async event=>{if(labelKptDrag){await finishKptDrag(event,canvas); return} if(!labelDragStart) return; const end=labelCanvasPoint(event); const start=labelDragStart; labelDragStart=null; canvas.releasePointerCapture(event.pointerId); drawLabelCanvas(); if(!end) return; const x=Math.min(start.x,end.x),y=Math.min(start.y,end.y),w=Math.abs(end.x-start.x),h=Math.abs(end.y-start.y); if(w<5||h<5){toast('标注框过小');return} const action=labelDrawMode==='edit'?'update':labelDrawMode==='sample'?'add_sample':'add'; if(action==='add_sample'&&!labelActiveObjectId){toast('请先在右侧选择要追加视角的目标');return} if(labelSessionState.task==='pose'&&action==='add'){toast('Pose 模式请点击“添加关键点目标”后按顺序点击关键点；手动改框请先选中目标再点“修正选中框”');return} let label=''; if(action==='add'){label=await chooseBrowserLabel(); if(!label) return} try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action,object_id:labelActiveObjectId,bbox:{x,y,w,h},label}); labelSessionState=j.state; if(action==='add') labelActiveObjectId=labelSessionState.objects.at(-1)?.id||null; if(labelSessionState.task==='pose') labelDrawMode='add'; renderLabelSession()}catch(e){toast(e.message)}}); window.addEventListener('resize',()=>drawLabelCanvas())}
 
 function labelCanvasPoint(event){const image=document.getElementById('label-frame-image'); if(!image||!labelSessionState) return null; const rect=image.getBoundingClientRect(); if(!rect.width||!rect.height) return null; return {x:(event.clientX-rect.left)*labelSessionState.width/rect.width,y:(event.clientY-rect.top)*labelSessionState.height/rect.height}}
-function drawLabelCanvas(dragEnd=null){const canvas=document.getElementById('label-frame-canvas'); const image=document.getElementById('label-frame-image'); if(!canvas||!image||!labelSessionState||image.hidden) return; const rect=image.getBoundingClientRect(); const dpr=window.devicePixelRatio||1; canvas.style.width=rect.width+'px'; canvas.style.height=rect.height+'px'; canvas.style.left=(rect.left-canvas.parentElement.getBoundingClientRect().left)+'px'; canvas.style.top=(rect.top-canvas.parentElement.getBoundingClientRect().top)+'px'; canvas.width=Math.max(1,Math.round(rect.width*dpr)); canvas.height=Math.max(1,Math.round(rect.height*dpr)); const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,rect.width,rect.height); const sx=rect.width/labelSessionState.width,sy=rect.height/labelSessionState.height; labelSessionState.objects.forEach((obj,index)=>{if(obj.hidden||labelHiddenObjectIds.has(obj.id)) return; const active=obj.id===labelActiveObjectId; ctx.strokeStyle=obj.ok?labelPalette(index):'#ff6678'; ctx.lineWidth=active?3:2; ctx.strokeRect(obj.x*sx,obj.y*sy,obj.w*sx,obj.h*sy); ctx.font='600 13px Microsoft YaHei UI'; const text=`#${obj.id} ${obj.label}${obj.ok?'':' LOST'}`; const tx=obj.x*sx,ty=Math.max(18,obj.y*sy-5); ctx.fillStyle='rgba(3,8,19,.85)'; const tw=ctx.measureText(text).width+10; ctx.fillRect(tx,ty-16,tw,20); ctx.fillStyle='#fff'; ctx.fillText(text,tx+5,ty)}); if(labelDragStart&&dragEnd){const x=Math.min(labelDragStart.x,dragEnd.x)*sx,y=Math.min(labelDragStart.y,dragEnd.y)*sy,w=Math.abs(labelDragStart.x-dragEnd.x)*sx,h=Math.abs(labelDragStart.y-dragEnd.y)*sy; ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=2;ctx.strokeRect(x,y,w,h);ctx.setLineDash([])}}
+function drawLabelCanvas(dragEnd=null){const canvas=document.getElementById('label-frame-canvas'); const image=document.getElementById('label-frame-image'); if(!canvas||!image||!labelSessionState||image.hidden) return; const rect=image.getBoundingClientRect(); const dpr=window.devicePixelRatio||1; canvas.style.width=rect.width+'px'; canvas.style.height=rect.height+'px'; canvas.style.left=(rect.left-canvas.parentElement.getBoundingClientRect().left)+'px'; canvas.style.top=(rect.top-canvas.parentElement.getBoundingClientRect().top)+'px'; canvas.width=Math.max(1,Math.round(rect.width*dpr)); canvas.height=Math.max(1,Math.round(rect.height*dpr)); const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,rect.width,rect.height); const sx=rect.width/labelSessionState.width,sy=rect.height/labelSessionState.height; labelSessionState.objects.forEach((obj,index)=>{if(obj.hidden||labelHiddenObjectIds.has(obj.id)) return; const active=obj.id===labelActiveObjectId; ctx.strokeStyle=obj.ok?labelPalette(index):'#ff6678'; ctx.lineWidth=active?3:2; ctx.strokeRect(obj.x*sx,obj.y*sy,obj.w*sx,obj.h*sy); ctx.font='600 13px Microsoft YaHei UI'; const text=`#${obj.id} ${obj.label}${obj.ok?'':' LOST'}`; const tx=obj.x*sx,ty=Math.max(18,obj.y*sy-5); ctx.fillStyle='rgba(3,8,19,.85)'; const tw=ctx.measureText(text).width+10; ctx.fillRect(tx,ty-16,tw,20); ctx.fillStyle='#fff'; ctx.fillText(text,tx+5,ty); drawPoseKeypoints(ctx,obj,sx,sy,active)}); drawPoseCollect(ctx,sx,sy); if(labelDragStart&&dragEnd){const x=Math.min(labelDragStart.x,dragEnd.x)*sx,y=Math.min(labelDragStart.y,dragEnd.y)*sy,w=Math.abs(labelDragStart.x-dragEnd.x)*sx,h=Math.abs(labelDragStart.y-dragEnd.y)*sy; ctx.strokeStyle='#fff';ctx.setLineDash([6,4]);ctx.lineWidth=2;ctx.strokeRect(x,y,w,h);ctx.setLineDash([])}}
+let labelPoseCollect=null;
+let labelKptDrag=null;
+function updateLabelTaskUI(){const task=document.querySelector('input[name="label_task"]:checked')?.value||'detect'; document.querySelectorAll('.label-pose-field').forEach(el=>el.hidden=task!=='pose')}
+function kptColor(i){return ['#ff5a5a','#ffb347','#ffe35a','#5aff8c','#5ad2ff','#b07bff','#ff7bd5','#ffffff'][i%8]}
+function poseKptName(i){return labelSessionState?.kpt_names?.[i]||`kpt${i}`}
+function updatePosePrompt(){const el=document.getElementById('label-pose-prompt'); if(!el||!labelSessionState||labelSessionState.task!=='pose') return; if(!labelPoseCollect){el.textContent='点击“添加关键点目标”开始；或选中目标后重标 / 拖动关键点微调。'; return} const i=labelPoseCollect.points.length; el.textContent=`${labelPoseCollect.mode==='update'?'重标 #'+labelPoseCollect.objectId:'新目标 '+labelPoseCollect.label}：请点击第 ${i+1}/${labelSessionState.kpt_count} 个点「${poseKptName(i)}」（Shift+点击=遮挡，S=跳过，⌫=撤销，Esc=取消）`}
+async function beginPoseCollect(update=false){if(!labelSessionId||labelSessionState?.task!=='pose'){toast('请先以 Pose 任务开始网页标注');return} stopBrowserLabelPlay(); if(update){const obj=labelSessionState.objects.find(o=>o.id===labelActiveObjectId); if(!obj){toast('请先在右侧选择目标');return} labelPoseCollect={mode:'update',objectId:obj.id,label:obj.label,points:[]}} else {const label=await chooseBrowserLabel(); if(!label) return; labelPoseCollect={mode:'add',objectId:null,label,points:[]}} labelDrawMode='add'; updatePosePrompt(); drawLabelCanvas()}
+function cancelPoseCollect(){labelPoseCollect=null; updatePosePrompt(); drawLabelCanvas()}
+function undoPosePoint(){if(!labelPoseCollect) return; labelPoseCollect.points.pop(); updatePosePrompt(); drawLabelCanvas()}
+function skipPosePoint(){if(!labelPoseCollect){toast('当前没有进行中的关键点标注');return} pushPosePoint([0,0,0])}
+function pushPosePoint(point){labelPoseCollect.points.push(point); updatePosePrompt(); drawLabelCanvas(); if(labelPoseCollect.points.length>=labelSessionState.kpt_count) submitPoseCollect()}
+async function submitPoseCollect(){const collectState=labelPoseCollect; if(!collectState) return; if(!collectState.points.some(p=>p[2]>0)){toast('至少需要一个可见或遮挡的关键点'); collectState.points.pop(); updatePosePrompt(); return} try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:collectState.mode==='update'?'update_pose':'add_pose',object_id:collectState.objectId,label:collectState.label,keypoints:collectState.points}); labelPoseCollect=null; labelSessionState=j.state; labelActiveObjectId=collectState.mode==='update'?collectState.objectId:(labelSessionState.objects.at(-1)?.id||null); renderLabelSession(); toast('关键点已记录')}catch(e){collectState.points.pop(); updatePosePrompt(); drawLabelCanvas(); toast(e.message)}}
+function hitPoseKeypoint(point){const image=document.getElementById('label-frame-image'); if(!image||!labelSessionState) return null; const rect=image.getBoundingClientRect(); const scale=labelSessionState.width/Math.max(1,rect.width); const radius=11*scale; let best=null; for(const obj of labelSessionState.objects){if(obj.hidden||labelHiddenObjectIds.has(obj.id)) continue; (obj.keypoints||[]).forEach((k,index)=>{if(k[2]<=0) return; const d=Math.hypot(k[0]-point.x,k[1]-point.y); if(d<=radius&&(!best||d<best.d)) best={obj,index,d}})} return best}
+function poseHandlePointerDown(event,point,canvas){if(labelPoseCollect){pushPosePoint([point.x,point.y,event.shiftKey?1:2]); return true} if(labelDrawMode!=='add') return false; const hit=hitPoseKeypoint(point); if(!hit) {toast('点击“添加关键点目标”开始标注，或拖动已有关键点微调'); return true} labelActiveObjectId=hit.obj.id; if(event.shiftKey){const k=hit.obj.keypoints[hit.index]; sendKptMove(hit.obj.id,hit.index,[k[0],k[1],k[2]===2?1:2]); return true} labelKptDrag={objectId:hit.obj.id,index:hit.index,point,v:hit.obj.keypoints[hit.index][2]}; canvas.setPointerCapture(event.pointerId); renderLabelSession(); return true}
+async function finishKptDrag(event,canvas){const drag=labelKptDrag; labelKptDrag=null; try{canvas.releasePointerCapture(event.pointerId)}catch(e){} await sendKptMove(drag.objectId,drag.index,[drag.point.x,drag.point.y,drag.v])}
+async function sendKptMove(objectId,index,point){try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:'move_kpt',object_id:objectId,index,point}); labelSessionState=j.state; renderLabelSession()}catch(e){toast(e.message); drawLabelCanvas()}}
+function drawKpt(ctx,x,y,index,v,active){const r=active?6:5; ctx.beginPath(); ctx.arc(x,y,r+1.5,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,.85)'; ctx.fill(); ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); if(v===2){ctx.fillStyle=kptColor(index); ctx.fill()} else {ctx.strokeStyle=kptColor(index); ctx.lineWidth=2; ctx.stroke()} ctx.font='700 12px Microsoft YaHei UI'; ctx.lineWidth=3; ctx.strokeStyle='rgba(0,0,0,.9)'; ctx.strokeText(String(index),x+7,y-7); ctx.fillStyle='#fff'; ctx.fillText(String(index),x+7,y-7)}
+function drawPoseKeypoints(ctx,obj,sx,sy,active){const kpts=obj.keypoints||[]; if(!kpts.length) return; const pts=kpts.map((k,index)=>(labelKptDrag&&labelKptDrag.objectId===obj.id&&labelKptDrag.index===index)?[labelKptDrag.point.x,labelKptDrag.point.y,k[2]]:k); ctx.strokeStyle=active?'rgba(255,255,255,.7)':'rgba(255,255,255,.35)'; ctx.lineWidth=1.5; ctx.setLineDash([4,3]); ctx.beginPath(); let started=false; pts.forEach(k=>{if(k[2]<=0){started=false;return} if(!started){ctx.moveTo(k[0]*sx,k[1]*sy); started=true} else ctx.lineTo(k[0]*sx,k[1]*sy)}); ctx.stroke(); ctx.setLineDash([]); pts.forEach((k,index)=>{if(k[2]>0) drawKpt(ctx,k[0]*sx,k[1]*sy,index,k[2],active)})}
+function drawPoseCollect(ctx,sx,sy){if(!labelPoseCollect) return; labelPoseCollect.points.forEach((k,index)=>{if(k[2]>0) drawKpt(ctx,k[0]*sx,k[1]*sy,index,k[2],true)})}
 function closeLabelChoice(value=''){const dialog=document.getElementById('label-choice-dialog'); if(dialog) dialog.hidden=true; document.body.style.overflow=''; const resolve=labelChoiceResolver; labelChoiceResolver=null; if(resolve) resolve(value)}
 function chooseBrowserLabel(){const labels=(labelSessionState?.labels||[]); const choices=labels.length?labels:(collect().label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean); if(choices.length===1) return Promise.resolve(choices[0]); return new Promise(resolve=>{const dialog=document.getElementById('label-choice-dialog'); const options=document.getElementById('label-choice-options'); const cancel=document.getElementById('label-choice-cancel'); if(!dialog||!options){resolve('');return} labelChoiceResolver=resolve; options.innerHTML=''; choices.forEach((label,index)=>{const button=document.createElement('button'); button.type='button'; button.className='label-choice-option'; button.innerHTML=`<span class="label-choice-option-key">${index<9?index+1:''}</span>`; const text=document.createElement('span'); text.textContent=label; button.appendChild(text); button.onclick=()=>closeLabelChoice(label); options.appendChild(button)}); cancel.onclick=()=>closeLabelChoice(''); dialog.onclick=event=>{if(event.target===dialog) closeLabelChoice('')}; dialog.onkeydown=event=>{if(event.key==='Escape'){event.preventDefault();closeLabelChoice('');return} const index=Number(event.key)-1; if(Number.isInteger(index)&&index>=0&&index<choices.length){event.preventDefault();closeLabelChoice(choices[index])}}; dialog.hidden=false; document.body.style.overflow='hidden'; requestAnimationFrame(()=>options.querySelector('button')?.focus())})}
 function setLabelDrawMode(mode){if(!labelSessionId){toast('请先开始网页标注');return} if((mode==='edit'||mode==='sample')&&!labelActiveObjectId){toast('请先在右侧选择目标');return} if(mode==='sample'&&labelSessionState?.tracker!=='multi_template'){toast('追加视角需要先选择 Multi-template（多角度）跟踪器');return} labelDrawMode=mode; toast(mode==='edit'?'请拖动绘制选中目标的新框':mode==='sample'?'请拖动绘制该目标在新角度下的框':'请拖动绘制新目标框')}
 
-async function startBrowserLabelSession(){const v=collect(); if(v.label_source_type==='images'&&!v.label_images_input_dir.trim()){toast('请填写图片集文件夹路径');return} if(v.label_source_type==='camera'&&!/^\d+$/.test(v.label_camera_index.trim())){toast('请输入非负整数摄像头索引，例如 0');return} if(v.label_source_type==='video'&&!v.label_video.trim()){toast('请先从队列选择视频或填写视频路径');return} if(labelSessionId) await endBrowserLabelSession(); try{const j=await api('/api/label-session/start',{values:v}); labelSessionId=j.state.session_id; sessionStorage.setItem('labelSessionId',labelSessionId); labelSessionState={...j.state,labels:(v.label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean)}; labelActiveObjectId=null; labelHiddenObjectIds.clear(); labelPlaying=false; showLabelStudio(true); setupLabelTimeline(); setupLabelCanvas(); renderLabelSession(); refreshLabelFrame(); toast('网页标注已就绪，请添加目标框')}catch(e){toast(e.message)}}
-async function advanceBrowserLabelFrame(){if(!labelSessionId||labelAdvanceBusy) return; labelAdvanceBusy=true; try{const j=await api('/api/label-session/advance',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(labelSessionState.lost||labelSessionState.ended) stopBrowserLabelPlay(); renderLabelSession(); refreshLabelFrame()}catch(e){stopBrowserLabelPlay();toast(e.message)}finally{labelAdvanceBusy=false}}
+async function startBrowserLabelSession(){const v=collect(); if(v.label_source_type==='images'&&!v.label_images_input_dir.trim()){toast('请填写图片集文件夹路径');return} if(v.label_source_type==='camera'&&!/^\d+$/.test(v.label_camera_index.trim())){toast('请输入非负整数摄像头索引，例如 0');return} if(v.label_source_type==='video'&&!v.label_video.trim()){toast('请先从队列选择视频或填写视频路径');return} if(labelSessionId) await endBrowserLabelSession(); try{const j=await api('/api/label-session/start',{values:v}); labelSessionId=j.state.session_id; sessionStorage.setItem('labelSessionId',labelSessionId); labelSessionState={...j.state,labels:(v.label_name||'object').split(/[,;\n]+/).map(x=>x.trim()).filter(Boolean)}; labelActiveObjectId=null; labelHiddenObjectIds.clear(); labelPlaying=false; showLabelStudio(true); setupLabelTimeline(); setupLabelCanvas(); renderLabelSession(); refreshLabelFrame(); toast(labelSessionState.task==='pose'?'Pose 标注已就绪，请点击“添加关键点目标”':'网页标注已就绪，请添加目标框')}catch(e){toast(e.message)}}
+async function advanceBrowserLabelFrame(){if(!labelSessionId||labelAdvanceBusy) return; labelAdvanceBusy=true; try{const j=await api('/api/label-session/advance',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(labelSessionState.track_warning&&labelPlaying) toast(labelSessionState.track_warning); if(labelSessionState.lost||labelSessionState.ended||labelSessionState.track_warning) stopBrowserLabelPlay(); renderLabelSession(); refreshLabelFrame()}catch(e){stopBrowserLabelPlay();toast(e.message)}finally{labelAdvanceBusy=false}}
 async function seekBrowserLabelFrame(frameIndex){if(!labelSessionId||labelAdvanceBusy||labelSessionState?.source_type!=='video') return; labelAdvanceBusy=true; stopBrowserLabelPlay(); try{const j=await api('/api/label-session/seek',{session_id:labelSessionId,frame_index:frameIndex}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; labelActiveObjectId=labelSessionState.objects[0]?.id||null; renderLabelSession(); refreshLabelFrame(); toast('已跳转到指定帧，请修正目标框后继续')}catch(e){toast(e.message)}finally{labelAdvanceBusy=false}}
 function toggleBrowserLabelPlay(){if(labelPlaying) stopBrowserLabelPlay();else startBrowserLabelPlay()}
-function startBrowserLabelPlay(){if(!labelSessionId){toast('请先开始网页标注');return} if(!labelSessionState?.objects.length){toast('请先添加至少一个目标框');return} if(labelSessionState.lost){toast('请先修正或删除丢失目标');return} labelPlaying=true; renderLabelSession(); const tick=async()=>{if(!labelPlaying) return; await advanceBrowserLabelFrame(); if(labelPlaying) labelPlayTimer=setTimeout(tick,45)}; tick()}
+function startBrowserLabelPlay(){if(!labelSessionId){toast('请先开始网页标注');return} if(labelPoseCollect){toast('请先完成或取消当前关键点标注');return} if(!labelSessionState?.objects.length){toast('请先添加至少一个目标框');return} if(labelSessionState.lost){toast('请先修正或删除丢失目标');return} labelPlaying=true; renderLabelSession(); const tick=async()=>{if(!labelPlaying) return; await advanceBrowserLabelFrame(); if(labelPlaying) labelPlayTimer=setTimeout(tick,45)}; tick()}
 function stopBrowserLabelPlay(){labelPlaying=false;clearTimeout(labelPlayTimer);labelPlayTimer=null;renderLabelSession()}
-async function saveBrowserLabelFrame(){if(!labelSessionId) return; try{const j=await api('/api/label-session/save',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; renderLabelSession(); if(j.saved){toast('当前帧已保存');loadLabelResults()}else toast('没有可保存的有效目标框')}catch(e){toast(e.message)}}
+async function saveBrowserLabelFrame(){if(!labelSessionId) return; try{const j=await api('/api/label-session/save',{session_id:labelSessionId}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; renderLabelSession(); if(j.saved){toast(j.saved==='background'?'已保存为背景图（无目标）':'当前帧已保存');loadLabelResults()}else toast('没有可保存的有效目标框；存背景图请先删除全部框')}catch(e){toast(e.message)}}
+async function undoBrowserLabelSave(){if(!labelSessionId||labelAdvanceBusy) return; stopBrowserLabelPlay(); labelAdvanceBusy=true; try{const j=await api('/api/label-session/undo',{session_id:labelSessionId}); labelPoseCollect=null; labelKptDrag=null; labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; if(!labelSessionState.objects.some(o=>o.id===labelActiveObjectId)) labelActiveObjectId=labelSessionState.objects[0]?.id||null; renderLabelSession(); refreshLabelFrame(); loadLabelResults(); toast(`已回退第 ${j.frame_index} 帧的保存，修正后点“保存当前帧”重新保存`)}catch(e){toast(e.message)}finally{labelAdvanceBusy=false}}
 async function deleteBrowserLabelObject(){if(!labelSessionId||!labelActiveObjectId){toast('请先选择目标');return} try{const j=await api('/api/label-session/object',{session_id:labelSessionId,action:'delete',object_id:labelActiveObjectId,bbox:{x:0,y:0,w:3,h:3}}); labelSessionState={...j.state,labels:labelSessionState?.labels||[]}; labelActiveObjectId=labelSessionState.objects[0]?.id||null; renderLabelSession()}catch(e){toast(e.message)}}
-async function endBrowserLabelSession(){stopBrowserLabelPlay(); if(!labelSessionId){showLabelStudio(false);return} try{await api('/api/label-session/end',{session_id:labelSessionId})}catch(e){} labelSessionId='';labelSessionState=null;labelActiveObjectId=null;labelHiddenObjectIds.clear();sessionStorage.removeItem('labelSessionId');showLabelStudio(false);loadLabelResults()}
+async function endBrowserLabelSession(){stopBrowserLabelPlay(); if(!labelSessionId){showLabelStudio(false);return} try{await api('/api/label-session/end',{session_id:labelSessionId})}catch(e){} labelSessionId='';labelSessionState=null;labelActiveObjectId=null;labelPoseCollect=null;labelKptDrag=null;labelHiddenObjectIds.clear();sessionStorage.removeItem('labelSessionId');showLabelStudio(false);loadLabelResults()}
 async function runLabelCurrent(){await startBrowserLabelSession()}
 async function copyCommand(action){try{const cmd=await command(action); await navigator.clipboard.writeText(cmd); toast('命令已复制')}catch(e){toast(e.message)}}
 async function runAction(action){try{await api('/api/run',{action,values:collect()}); showTab(action==='rknn_deploy'?'rknn':'logs'); toast('任务已启动'); refreshState()}catch(e){toast(e.message)}}
@@ -2541,7 +3013,7 @@ function updateJobInputMode(){const input=document.getElementById('job-input'); 
 async function stopJob(){try{const j=await api('/api/stop',{}); toast(j.stopped?'已请求停止':'当前没有正在运行的任务'); refreshState()}catch(e){toast(e.message)}}
 function openImageLightbox(src,title){const box=document.getElementById('image-lightbox'); const image=document.getElementById('image-lightbox-image'); const caption=document.getElementById('image-lightbox-title'); if(!box||!image||!caption) return; image.src=src; image.alt=title; caption.textContent=title; box.hidden=false; document.body.style.overflow='hidden'; document.getElementById('image-lightbox-close')?.focus()}
 function closeImageLightbox(){const box=document.getElementById('image-lightbox'); if(!box||box.hidden) return; box.hidden=true; document.body.style.overflow=''}
-async function loadLabelResults(){try{await saveValues(); const r=await fetch('/api/label-results'); const j=await r.json(); const box=document.getElementById('label-results'); box.innerHTML=''; const items=j.items||[]; if(!items.length){box.innerHTML='<div class="empty">当前图片目录和标注目录中还没有可显示的标注结果。</div>'; return} for(const it of items){const card=document.createElement('div'); card.className='sample'; const src='/api/label-preview?image='+encodeURIComponent(it.image)+'&xml='+encodeURIComponent(it.xml)+'&t='+Date.now(); const title=`${it.stem} · ${(it.boxes||[]).length} 个框`; card.innerHTML=`<button class="preview-trigger" type="button" aria-label="放大查看 ${title}"><img src="${src}" loading="lazy" alt="${title}"></button><div class="meta"><b>${it.stem}</b><span>${(it.boxes||[]).length} 个框</span><button class="delete">删除标注</button></div>`; card.querySelector('.preview-trigger').onclick=()=>openImageLightbox(src,title); card.querySelector('.delete').onclick=async()=>{const imageMode=collect().label_source_type==='images'; const target=imageMode?'对应 XML 标注':'这张图片和对应 XML'; if(Date.now()>deleteConfirmUntil){if(!confirm(`确定删除${target}吗？\n确认后 5 分钟内删除标注不再重复询问。`)) return; deleteConfirmUntil=Date.now()+5*60*1000} await api('/api/delete-label-sample',{image:it.image,xml:it.xml}); card.remove(); toast(imageMode?'已删除 XML 标注':'已删除废图和 XML')}; box.appendChild(card)}}catch(e){toast(e.message)}}
+async function loadLabelResults(){try{await saveValues(); const r=await fetch('/api/label-results'); const j=await r.json(); const box=document.getElementById('label-results'); box.innerHTML=''; const items=j.items||[]; if(!items.length){box.innerHTML='<div class="empty">当前图片目录和标注目录中还没有可显示的标注结果。</div>'; return} for(const it of items){const card=document.createElement('div'); card.className='sample'; const src='/api/label-preview?image='+encodeURIComponent(it.image)+'&xml='+encodeURIComponent(it.xml)+'&t='+Date.now(); const title=`${it.stem} · ${(it.boxes||[]).length} 个框`; card.innerHTML=`<button class="preview-trigger" type="button" aria-label="放大查看 ${title}"><img src="${src}" loading="lazy" alt="${title}"></button><div class="meta"><b>${it.stem}</b><span>${(it.boxes||[]).length} 个框</span><button class="delete">删除标注</button></div>`; card.querySelector('.preview-trigger').onclick=()=>openImageLightbox(src,title); card.querySelector('.delete').onclick=async()=>{const imageMode=collect().label_source_type==='images'; const ext=it.xml.toLowerCase().endsWith('.txt')?'txt':'XML'; const target=imageMode?`对应 ${ext} 标注`:`这张图片和对应 ${ext}`; if(Date.now()>deleteConfirmUntil){if(!confirm(`确定删除${target}吗？\n确认后 5 分钟内删除标注不再重复询问。`)) return; deleteConfirmUntil=Date.now()+5*60*1000} await api('/api/delete-label-sample',{image:it.image,xml:it.xml}); card.remove(); toast(imageMode?`已删除 ${ext} 标注`:`已删除废图和 ${ext}`)}; box.appendChild(card)}}catch(e){toast(e.message)}}
 async function loadTrainPlots(){try{const r=await fetch('/api/train-plots'); const j=await r.json(); const box=document.getElementById('train-plots'); if(!box) return; const note=document.getElementById('train-plots-note'); const items=j.items||[]; if(note) note.textContent=items.length?`已发现 ${items.length} 张图片`:'训练开始后自动刷新'; if(!items.length){box.innerHTML='<div class="empty">训练进行中或尚未生成可视化图。</div>'; return} box.innerHTML=''; for(const item of items){const card=document.createElement('div'); card.className='sample'; card.innerHTML=`<img src="/api/train-plot?name=${encodeURIComponent(item.name)}&t=${Date.now()}" loading="lazy"><div class="meta"><b>${item.name}</b></div>`; box.appendChild(card)}}catch(e){}}
 function scheduleLabelResultsRefresh(){clearTimeout(labelResultsTimer); labelResultsTimer=setTimeout(()=>loadLabelResults(),350)}
 function logLines(text){if(!text) return []; const lines=text.replace(/\r\n?/g,'\n').split('\n'); if(lines.at(-1)==='') lines.pop(); return lines}
@@ -2565,12 +3037,12 @@ document.getElementById('environment-close')?.addEventListener('click',closeEnvi
 document.getElementById('environment-dialog')?.addEventListener('click',event=>{if(event.target===event.currentTarget) closeEnvironment()});
 document.getElementById('image-lightbox-close')?.addEventListener('click',closeImageLightbox);
 document.getElementById('image-lightbox')?.addEventListener('click',event=>{if(event.target===event.currentTarget) closeImageLightbox()});
-document.addEventListener('keydown',event=>{if(event.key==='Escape'){closeImageLightbox(); closeEnvironment()}});
+document.addEventListener('keydown',event=>{if(labelPoseCollect&&!event.target.closest?.('input,select,textarea')){if(event.key==='Escape'){event.preventDefault(); cancelPoseCollect(); return} if(event.key==='s'||event.key==='S'){event.preventDefault(); skipPosePoint(); return} if(event.key==='Backspace'){event.preventDefault(); undoPosePoint(); return}} if((event.ctrlKey||event.metaKey)&&!event.shiftKey&&(event.key==='z'||event.key==='Z')&&labelSessionId&&!labelPoseCollect&&!event.target.closest?.('input,select,textarea')){event.preventDefault(); undoBrowserLabelSave(); return} if(event.key==='Escape'){closeImageLightbox(); closeEnvironment()}});
 document.getElementById('log-search')?.addEventListener('input',()=>renderLogs());
 document.getElementById('log-level')?.addEventListener('change',()=>renderLogs());
 document.getElementById('log-follow')?.addEventListener('change',event=>setLogFollow(event.currentTarget.checked));
 document.getElementById('log')?.addEventListener('scroll',event=>{const log=event.currentTarget; if(!logAutoScrolling&&log.scrollHeight-log.scrollTop-log.clientHeight>36) setLogFollow(false)});
-document.querySelectorAll('input:not([data-local-control]),select:not([data-local-control])').forEach(el=>{const handler=()=>{if(el.id==='label_prefix') rawLabelPrefix.manual=true; if(el.name==='train_task') updateTrainTaskUI(); if(el.name==='label_source_type') updateLabelSourceUI(); if(el.id==='rknn_mode'||el.id==='rknn_calibration_count') updateRknnModeUI(); collect(); updateCurrentVideo(); saveValues(); updateCommands(); if(['train_images_dir','base_model','img_width','img_height','image_resize_mode','batch','train_cache'].includes(el.id)||el.name==='train_device'||el.name==='train_task') scheduleResourceEstimate(); if(['label_images_dir','label_annotations_dir','label_annotations_dir_images','label_images_input_dir'].includes(el.id)) scheduleLabelResultsRefresh()}; el.addEventListener('input',handler); el.addEventListener('change',handler)});
+document.querySelectorAll('input:not([data-local-control]),select:not([data-local-control])').forEach(el=>{const handler=()=>{if(el.id==='label_prefix') rawLabelPrefix.manual=true; if(el.name==='train_task') updateTrainTaskUI(); if(el.name==='label_source_type') updateLabelSourceUI(); if(el.name==='label_task'){switchLabelTask(); updateLabelTaskUI(); scheduleLabelResultsRefresh()} if(el.id==='rknn_mode'||el.id==='rknn_calibration_count') updateRknnModeUI(); collect(); updateCurrentVideo(); saveValues(); updateCommands(); if(['train_images_dir','base_model','img_width','img_height','image_resize_mode','batch','train_cache'].includes(el.id)||el.name==='train_device'||el.name==='train_task') scheduleResourceEstimate(); if(['label_images_dir','label_annotations_dir','label_annotations_dir_images','label_images_input_dir'].includes(el.id)) scheduleLabelResultsRefresh()}; el.addEventListener('input',handler); el.addEventListener('change',handler)});
 updateSplitRatio();
 refreshState().then(()=>fillTrainConfigFromEnvironment(false)); setInterval(refreshState,1400);
 
@@ -2749,7 +3221,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     values = STATE["values"].copy()
                 image_path = resolve_under(image, label_result_images_dir(values))
                 xml_path = resolve_under(xml, Path(values["label_annotations_dir"]))
-                raw = render_label_preview(image_path, xml_path)
+                raw = render_label_preview(image_path, xml_path, parse_int(values.get("label_kpt_count", "")) or 0)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Cache-Control", "no-store")
@@ -2904,6 +3376,54 @@ class PanelHandler(BaseHTTPRequestHandler):
                     elif action == "delete":
                         object_id = int(body.get("object_id", 0))
                         session["objects"] = [obj for obj in session["objects"] if obj.obj_id != object_id]
+                    elif action in {"add_pose", "update_pose", "move_kpt"}:
+                        if session["task"] != "pose":
+                            raise ValueError("当前会话不是 pose 标注任务。")
+                        width, height = frame.shape[1], frame.shape[0]
+                        obj = None
+                        if action != "add_pose":
+                            object_id = int(body.get("object_id", 0))
+                            obj = next((item for item in session["objects"] if item.obj_id == object_id), None)
+                            if obj is None:
+                                raise ValueError("要修改关键点的目标不存在。")
+                        if action == "move_kpt":
+                            index = int(body.get("index", -1))
+                            if not 0 <= index < len(obj.keypoints):
+                                raise ValueError("关键点序号超出范围。")
+                            point = body.get("point") or [0, 0, 2]
+                            keypoints = [list(item) for item in obj.keypoints]
+                            keypoints[index] = point
+                            parsed = parse_label_keypoints(keypoints, session["kpt_count"], width, height)
+                            # Only the dragged point is clamped; tracked points may sit off-screen.
+                            obj.keypoints = [parsed[i] if i == index else list(item) for i, item in enumerate(obj.keypoints)]
+                            obj.ok = True
+                            if obj.bbox_auto:
+                                obj.bbox = bbox_from_keypoints(obj.keypoints, width, height)
+                                obj.tracker = make_label_tracker(session["tracker"])
+                                obj.ok = init_label_tracker(obj.tracker, frame, obj.bbox)
+                        else:
+                            keypoints = parse_label_keypoints(body.get("keypoints"), session["kpt_count"], width, height)
+                            manual_box = bbox_raw and bbox[2] >= 3 and bbox[3] >= 3
+                            pose_bbox = bbox if manual_box else bbox_from_keypoints(keypoints, width, height)
+                            tracker = make_label_tracker(session["tracker"])
+                            if not init_label_tracker(tracker, frame, pose_bbox):
+                                raise ValueError("跟踪器初始化失败，请手动拖一个更大的框。")
+                            if action == "add_pose":
+                                label = str(body.get("label", "")).strip()
+                                if label not in session["labels"]:
+                                    raise ValueError("请选择当前标签列表中的类别。")
+                                session["objects"].append(LabelTrackObject(
+                                    session["next_object_id"], label, pose_bbox, tracker,
+                                    keypoints=keypoints, bbox_auto=not manual_box,
+                                ))
+                                session["next_object_id"] += 1
+                            else:
+                                obj.keypoints = keypoints
+                                obj.bbox = pose_bbox
+                                obj.bbox_auto = not manual_box
+                                obj.tracker = tracker
+                                obj.ok = True
+                                obj.sample_count = 1
                     else:
                         if bbox[2] < 3 or bbox[3] < 3:
                             raise ValueError("标注框过小，请重新绘制。")
@@ -2923,10 +3443,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                                 obj.sample_count += 1
                             else:
                                 obj.bbox = bbox
+                                obj.bbox_auto = False
                                 obj.tracker = make_label_tracker(session["tracker"])
                                 obj.ok = init_label_tracker(obj.tracker, frame, bbox)
                                 obj.sample_count = 1
                         else:
+                            if session["task"] == "pose":
+                                raise ValueError("pose 任务请按顺序点击关键点来添加目标。")
                             label = str(body.get("label", "")).strip()
                             if label not in session["labels"]:
                                 raise ValueError("请选择当前标签列表中的类别。")
@@ -2935,15 +3458,23 @@ class PanelHandler(BaseHTTPRequestHandler):
                                 raise ValueError("跟踪器初始化失败，请换一个更大的标注框。")
                             session["objects"].append(LabelTrackObject(session["next_object_id"], label, bbox, tracker))
                             session["next_object_id"] += 1
+                    session["track_warning"] = ""
                     state = label_session_state(session)
                 self.send_json({"ok": True, "state": state})
                 return
             if self.path == "/api/label-session/save":
                 session = get_label_session(str(body.get("session_id", "")))
                 with session["lock"]:
-                    saved = save_label_session_sample(session)
+                    saved = save_label_session_sample(session, allow_background=True)
                     state = label_session_state(session)
                 self.send_json({"ok": True, "saved": saved, "state": state})
+                return
+            if self.path == "/api/label-session/undo":
+                session = get_label_session(str(body.get("session_id", "")))
+                with session["lock"]:
+                    frame_index = undo_label_session_save(session)
+                    state = label_session_state(session)
+                self.send_json({"ok": True, "frame_index": frame_index, "state": state})
                 return
             if self.path == "/api/label-session/end":
                 end_label_session(str(body.get("session_id", "")))

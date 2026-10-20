@@ -98,6 +98,16 @@ def run_train_command(cmd, stop_signal: Path | None = None, cwd=None):
         stdin=sys.stdin,
         start_new_session=True,
     )
+
+    # The child runs in its own session, so the panel's killpg on our group never reaches it;
+    # forward termination explicitly instead of leaving an orphaned trainer on the GPU.
+    def forward_termination(signum, _frame):
+        interrupt_process_tree(proc)
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, forward_termination)
     while True:
         code = proc.poll()
         if code is not None:
@@ -126,34 +136,32 @@ def torch_install_args(torch_cuda):
     return ["torch", "torchvision", "torchaudio", "--index-url", index_url]
 
 
+def find_env_exe(exe):
+    """Find a console script of the running Python env first, so a non-activated venv still works."""
+    bin_dir = Path(sys.executable).parent
+    for candidate in (bin_dir / exe, bin_dir / "Scripts" / (exe + ".exe"), bin_dir / (exe + ".exe")):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return [str(candidate)]
+    found = shutil.which(exe)
+    if found:
+        return [found]
+    return [exe]
+
+
 def build_env_cmd(conda_env, exe):
 
     conda_env = conda_env.strip()
     current_env = (os.environ.get("CONDA_DEFAULT_ENV") or "").strip()
 
     if conda_env and current_env.lower() == conda_env.lower():
-        if exe == "python":
-            return [sys.executable]
-        found = shutil.which(exe)
-        if found:
-            return [found]
-        scripts_exe = Path(sys.executable).parent / "Scripts" / (exe + ".exe")
-        if scripts_exe.exists():
-            return [str(scripts_exe)]
-        return [exe]
+        return [sys.executable] if exe == "python" else find_env_exe(exe)
 
     conda = shutil.which("conda")
     if conda_env and conda:
         return [conda, "run", "--no-capture-output", "-n", conda_env, exe]
-    if exe == "python":
-        return [sys.executable]
-    found = shutil.which(exe)
-    if found:
-        return [found]
-    scripts_exe = Path(sys.executable).parent / "Scripts" / (exe + ".exe")
-    if scripts_exe.exists():
-        return [str(scripts_exe)]
-    return [exe]
+    if conda_env:
+        print(f"info=未找到 conda，忽略 Conda Env={conda_env}，使用当前 Python：{sys.executable}", flush=True)
+    return [sys.executable] if exe == "python" else find_env_exe(exe)
 
 
 def parse_train_ratio_percent(value):
@@ -175,8 +183,12 @@ def detection_source_group(image_path: Path) -> str:
     return match.group("source") if match else image_path.stem
 
 
-def split_detection_records(records, val_ratio, seed=42, split_mode="video_group"):
-    """Split detection records, keeping frames from one video in one split."""
+def split_detection_records(records, val_ratio, seed=42, split_mode="video_group", val_groups=""):
+    """Split detection records, keeping frames from one video in one split.
+
+    val_groups: comma-separated video prefixes forced into val (video_group mode only);
+    keeps the validation set fixed across rounds so metrics stay comparable.
+    """
     target_val_count = max(1, min(int(round(len(records) * val_ratio)), len(records) - 1))
     if split_mode == "random":
         shuffled = list(records)
@@ -202,10 +214,19 @@ def split_detection_records(records, val_ratio, seed=42, split_mode="video_group
         class_group_counts.update(counts.keys())
 
     group_names = sorted(groups)
+    best_candidate = None
+    fixed_val = [name.strip() for name in str(val_groups or "").split(",") if name.strip()]
+    if fixed_val:
+        missing = sorted(set(fixed_val) - set(group_names))
+        if missing:
+            raise SystemExit(f"--val-groups 中的视频前缀不存在: {missing}")
+        if len(set(fixed_val)) >= len(group_names):
+            raise SystemExit("--val-groups 不能包含全部视频前缀，训练集会为空")
+        best_candidate = (None, tuple(sorted(set(fixed_val))))
+        print(f"split_fixed_val_groups={','.join(best_candidate[1])}")
     randomizer = random.Random(seed)
     attempts = max(256, min(8192, 400000 // len(group_names)))
-    best_candidate = None
-    for _ in range(attempts):
+    for _ in range(0 if fixed_val else attempts):
         order = group_names.copy()
         randomizer.shuffle(order)
         selected = []
@@ -341,7 +362,7 @@ def transform_image_and_boxes(image_path: Path, boxes, source_size, target_size,
     return image, [box for box in (clip_box(box, target_width, target_height) for box in transformed) if box]
 
 
-def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_ratio_percent=80, seed=42, img_width=448, img_height=448, resize_mode="letterbox", split_mode="video_group"):
+def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_ratio_percent=80, seed=42, img_width=448, img_height=448, resize_mode="letterbox", split_mode="video_group", val_groups=""):
     train_ratio_percent = parse_train_ratio_percent(train_ratio_percent)
     val_ratio = max(0.0, min(0.99, (100.0 - train_ratio_percent) / 100.0))
     img_dir = images_dir.resolve()
@@ -365,6 +386,8 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
         if width <= 0 or height <= 0:
             continue
         boxes = []
+        # 不含任何 <object> 的 XML 视为背景图（负样本）；有 object 但全部无效的仍按坏标注跳过
+        background = not root.findall("object")
         for obj in root.findall("object"):
             name = (obj.findtext("name") or "").strip()
             box = obj.find("bndbox")
@@ -376,15 +399,18 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
                     classes.append(name)
                 boxes.append(parsed)
         image_path = img_dir / filename
-        if image_path.exists() and boxes:
+        if image_path.exists() and (boxes or background):
             records.append((image_path, (width, height), boxes))
 
     if not records:
         raise SystemExit("No valid image/xml records found")
+    background_count = sum(1 for record in records if not record[2])
+    if background_count == len(records):
+        raise SystemExit("只有背景图，没有任何标注框")
     if len(records) < 2:
         raise SystemExit("至少需要 2 张有效标注图片，才能划分训练集和验证集")
 
-    splits = split_detection_records(records, val_ratio, seed=seed, split_mode=split_mode)
+    splits = split_detection_records(records, val_ratio, seed=seed, split_mode=split_mode, val_groups=val_groups)
     class_ids = {name: index for index, name in enumerate(classes)}
 
     output_counts = {}
@@ -395,8 +421,9 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
         label_output_dir.mkdir(parents=True, exist_ok=True)
         written = 0
         for image_path, source_size, boxes in items:
+            is_background = not boxes
             image, boxes = transform_image_and_boxes(image_path, boxes, source_size, (img_width, img_height), resize_mode)
-            if not boxes:
+            if not boxes and not is_background:
                 continue
             output_stem = image_path.stem
             image.save(image_output_dir / f"{output_stem}.jpg", quality=95)
@@ -407,7 +434,7 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
                 bw = (xmax - xmin) / img_width
                 bh = (ymax - ymin) / img_height
                 lines.append(f"{class_ids[name]} {xc:.8f} {yc:.8f} {bw:.8f} {bh:.8f}")
-            (label_output_dir / f"{output_stem}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            (label_output_dir / f"{output_stem}.txt").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
             written += 1
         output_counts[split] = written
     if not output_counts.get("train") or not output_counts.get("val"):
@@ -429,7 +456,244 @@ def prepare_voc_yolo(images_dir: Path, annotations_dir: Path, out: Path, train_r
                 writer.writerow([split, detection_source_group(image_path), image_path.name])
     print(f"classes={classes}")
     print(f"image_resize_mode={resize_mode} target_size={img_width}x{img_height}")
-    print(f"train={len(splits['train'])} val={len(splits['val'])}")
+    print(f"train={len(splits['train'])} val={len(splits['val'])} background={background_count}")
+    print(f"split_manifest={split_manifest}")
+    return dataset_yaml, classes
+
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def parse_int_list(value, option):
+    text = (value or "").strip()
+    if not text:
+        return []
+    try:
+        return [int(item) for item in re.split(r"[\s,]+", text) if item]
+    except ValueError:
+        raise SystemExit(f"{option} 必须是逗号分隔的整数，例如 1,0,3,2,4,5")
+
+
+def parse_float_list(value, option):
+    text = (value or "").strip()
+    if not text:
+        return []
+    try:
+        return [float(item) for item in re.split(r"[\s,]+", text) if item]
+    except ValueError:
+        raise SystemExit(f"{option} 必须是逗号分隔的数字，例如 0.05,0.05,0.05")
+
+
+def resize_point_mapper(source_size, target_size, resize_mode):
+    """Return a function mapping source pixel coords to target pixel coords, matching transform_image_and_boxes."""
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    if resize_mode == "crop":
+        target_ratio = target_width / target_height
+        if source_width / source_height > target_ratio:
+            crop_width = round(source_height * target_ratio)
+            left, top, width, height = (source_width - crop_width) // 2, 0, crop_width, source_height
+        else:
+            crop_height = round(source_width / target_ratio)
+            left, top, width, height = 0, (source_height - crop_height) // 2, source_width, crop_height
+        scale_x, scale_y = target_width / width, target_height / height
+        return lambda x, y: ((x - left) * scale_x, (y - top) * scale_y)
+    if resize_mode == "stretch":
+        scale_x, scale_y = target_width / source_width, target_height / source_height
+        return lambda x, y: (x * scale_x, y * scale_y)
+    scale = min(target_width / source_width, target_height / source_height)
+    pad_left = (target_width - round(source_width * scale)) // 2
+    pad_top = (target_height - round(source_height * scale)) // 2
+    return lambda x, y: (x * scale + pad_left, y * scale + pad_top)
+
+
+def find_image_for_stem(images_dir: Path, stem: str):
+    for suffix in IMAGE_EXTENSIONS + tuple(ext.upper() for ext in IMAGE_EXTENSIONS):
+        candidate = images_dir / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_pose_classes(labels_dir: Path, class_names, max_class_id):
+    names = [name.strip() for name in (class_names or "").split(",") if name.strip()]
+    if not names:
+        classes_file = labels_dir / "classes.txt"
+        if classes_file.is_file():
+            names = [line.strip() for line in classes_file.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    if not names:
+        names = [f"class{index}" for index in range(max_class_id + 1)]
+    if max_class_id >= len(names):
+        raise SystemExit(f"姿态标注中出现类别 id={max_class_id}，但类别名称只有 {len(names)} 个：{names}")
+    return names
+
+
+def prepare_pose_yolo(images_dir: Path, labels_dir: Path, out: Path, kpt_count, flip_idx=None, kpt_sigmas=None, class_names="", train_ratio_percent=80, seed=42, img_width=448, img_height=448, resize_mode="letterbox", split_mode="video_group", val_groups=""):
+    """Build an Ultralytics pose dataset from YOLO pose txt labels.
+
+    Each label row: cls cx cy w h x1 y1 [v1] ... xk yk [vk], all coordinates normalized to the source image.
+    Keypoints are resized with the image; points that fall outside the output image become invisible (v=0).
+    """
+    train_ratio_percent = parse_train_ratio_percent(train_ratio_percent)
+    val_ratio = max(0.0, min(0.99, (100.0 - train_ratio_percent) / 100.0))
+    img_dir = images_dir.resolve()
+    lbl_dir = labels_dir.resolve()
+    if not img_dir.is_dir() or not lbl_dir.is_dir():
+        raise SystemExit("姿态训练需要有效的 Images Dir 和关键点标注（YOLO pose txt）目录")
+    if resize_mode not in {"crop", "letterbox", "stretch"}:
+        raise SystemExit("--image-resize-mode 必须是 crop、letterbox 或 stretch")
+    if not kpt_count or kpt_count < 1:
+        raise SystemExit("--kpt-count 必须是大于 0 的整数")
+    flip_idx = list(flip_idx or [])
+    if flip_idx and sorted(flip_idx) != list(range(kpt_count)):
+        raise SystemExit(f"--flip-idx 必须是 0..{kpt_count - 1} 的一个排列，当前为 {flip_idx}")
+    kpt_sigmas = list(kpt_sigmas or [])
+    if kpt_sigmas and len(kpt_sigmas) != kpt_count:
+        raise SystemExit(f"--kpt-sigmas 数量必须等于关键点数 {kpt_count}，当前为 {len(kpt_sigmas)}")
+
+    raw_records = []
+    max_class_id = -1
+    skipped = 0
+    for label_path in sorted(lbl_dir.glob("*.txt")):
+        if label_path.name == "classes.txt":
+            continue
+        image_path = find_image_for_stem(img_dir, label_path.stem)
+        if image_path is None:
+            skipped += 1
+            continue
+        instances = []
+        for line_number, line in enumerate(label_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+            parts = line.split()
+            if not parts:
+                continue
+            extra = len(parts) - 5
+            if extra == kpt_count * 3:
+                ndim = 3
+            elif extra == kpt_count * 2:
+                ndim = 2
+            else:
+                raise SystemExit(
+                    f"{label_path}:{line_number} 列数为 {len(parts)}，应为 5+{kpt_count}*3={5 + kpt_count * 3}"
+                    f"（或不含可见性的 5+{kpt_count}*2），请核对 --kpt-count"
+                )
+            try:
+                values = [float(item) for item in parts]
+            except ValueError:
+                raise SystemExit(f"{label_path}:{line_number} 含有非数字内容")
+            class_id = int(values[0])
+            if class_id < 0:
+                raise SystemExit(f"{label_path}:{line_number} 类别 id 不能为负数")
+            max_class_id = max(max_class_id, class_id)
+            keypoints = []
+            for index in range(kpt_count):
+                offset = 5 + index * ndim
+                x, y = values[offset], values[offset + 1]
+                visibility = values[offset + 2] if ndim == 3 else 2.0
+                keypoints.append((x, y, visibility))
+            instances.append((class_id, values[1:5], keypoints))
+        # 空 txt 视为背景图（负样本）
+        if instances or not label_path.read_text(encoding="utf-8-sig").strip():
+            raw_records.append((image_path, instances))
+        else:
+            skipped += 1
+
+    if not raw_records:
+        raise SystemExit("未找到有效的 图片/姿态标注 对；标注文件应与图片同名，扩展名为 .txt")
+    if len(raw_records) < 2:
+        raise SystemExit("至少需要 2 张有效标注图片，才能划分训练集和验证集")
+    classes = load_pose_classes(lbl_dir, class_names, max_class_id)
+
+    records = []
+    keypoints_by_image = {}
+    for image_path, instances in raw_records:
+        with Image.open(image_path) as opened:
+            width, height = opened.size
+        boxes = []
+        keypoints_by_image[image_path] = []
+        for class_id, (cx, cy, bw, bh), keypoints in instances:
+            box = clip_box((classes[class_id], (cx - bw / 2) * width, (cy - bh / 2) * height, (cx + bw / 2) * width, (cy + bh / 2) * height), width, height)
+            if box is None:
+                continue
+            boxes.append(box)
+            keypoints_by_image[image_path].append(
+                [(x * width, y * height, visibility) for x, y, visibility in keypoints]
+            )
+        if boxes or not instances:
+            records.append((image_path, (width, height), boxes))
+    if len(records) < 2:
+        raise SystemExit("有效姿态标注图片少于 2 张")
+    background_count = sum(1 for record in records if not record[2])
+    if background_count == len(records):
+        raise SystemExit("只有背景图，没有任何姿态标注")
+
+    splits = split_detection_records(records, val_ratio, seed=seed, split_mode=split_mode, val_groups=val_groups)
+    class_ids = {name: index for index, name in enumerate(classes)}
+
+    output_counts = {}
+    hidden_points = 0
+    for split, items in splits.items():
+        image_output_dir = out / "images" / split
+        label_output_dir = out / "labels" / split
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        label_output_dir.mkdir(parents=True, exist_ok=True)
+        written = 0
+        for image_path, source_size, boxes in items:
+            # Tag each box with its instance index so keypoints stay aligned after clipping drops boxes.
+            tagged = [(index, *box[1:]) for index, box in enumerate(boxes)]
+            image, tagged = transform_image_and_boxes(image_path, tagged, source_size, (img_width, img_height), resize_mode)
+            if not tagged and boxes:
+                continue
+            mapper = resize_point_mapper(source_size, (img_width, img_height), resize_mode)
+            lines = []
+            for index, xmin, ymin, xmax, ymax in tagged:
+                xc = ((xmin + xmax) / 2) / img_width
+                yc = ((ymin + ymax) / 2) / img_height
+                bw = (xmax - xmin) / img_width
+                bh = (ymax - ymin) / img_height
+                fields = [str(class_ids[boxes[index][0]]), f"{xc:.8f}", f"{yc:.8f}", f"{bw:.8f}", f"{bh:.8f}"]
+                for x, y, visibility in keypoints_by_image[image_path][index]:
+                    tx, ty = mapper(x, y)
+                    inside = 0 <= tx <= img_width and 0 <= ty <= img_height
+                    if visibility <= 0 or not inside:
+                        hidden_points += int(visibility > 0)
+                        fields += ["0.00000000", "0.00000000", "0"]
+                    else:
+                        fields += [f"{tx / img_width:.8f}", f"{ty / img_height:.8f}", "2" if visibility >= 2 else "1"]
+                lines.append(" ".join(fields))
+            output_stem = image_path.stem
+            image.save(image_output_dir / f"{output_stem}.jpg", quality=95)
+            (label_output_dir / f"{output_stem}.txt").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+            written += 1
+        output_counts[split] = written
+    if not output_counts.get("train") or not output_counts.get("val"):
+        raise SystemExit("当前裁剪方式移除了训练集或验证集的全部标注框；请改用等比缩放或拉伸。")
+
+    yaml_lines = [
+        f"path: {out.as_posix()}",
+        "train: images/train",
+        "val: images/val",
+        f"kpt_shape: [{kpt_count}, 3]",
+    ]
+    if flip_idx:
+        yaml_lines.append(f"flip_idx: [{', '.join(str(item) for item in flip_idx)}]")
+    if kpt_sigmas:
+        yaml_lines.append(f"kpt_oks_sigmas: [{', '.join(f'{item:g}' for item in kpt_sigmas)}]")
+    yaml_lines.append("names:")
+    yaml_lines += [f"  {i}: {name}" for i, name in enumerate(classes)]
+    dataset_yaml = out / "dataset.yaml"
+    dataset_yaml.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+    (out / "classes.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+    split_manifest = out / "split_manifest.csv"
+    with split_manifest.open("w", encoding="utf-8", newline="") as manifest_file:
+        writer = csv.writer(manifest_file)
+        writer.writerow(["split", "source_group", "image"])
+        for split, items in splits.items():
+            for image_path, _, _ in items:
+                writer.writerow([split, detection_source_group(image_path), image_path.name])
+    print(f"classes={classes}")
+    print(f"kpt_shape=[{kpt_count}, 3] flip_idx={flip_idx or '未设置(将关闭翻转增强)'}")
+    print(f"image_resize_mode={resize_mode} target_size={img_width}x{img_height}")
+    print(f"train={len(splits['train'])} val={len(splits['val'])} background={background_count} skipped_labels={skipped} hidden_keypoints={hidden_points}")
     print(f"split_manifest={split_manifest}")
     return dataset_yaml, classes
 
@@ -514,7 +778,7 @@ param(
     [Parameter(Mandatory=$true)][int]$Epochs,
     [Parameter(Mandatory=$true)][int]$Batch,
     [Parameter(Mandatory=$true)][double]$Lr0,
-    [ValidateSet("detect", "classify")][string]$TrainTask = "detect",
+    [ValidateSet("detect", "classify", "pose")][string]$TrainTask = "detect",
     [string]$CondaEnv = "yolov8",
     [string]$TorchCuda = "cu128",
     [ValidateSet("cuda", "cpu")][string]$TrainDevice = "cuda",
@@ -538,7 +802,7 @@ Remove-Item -Recurse -Force $JobDir, $ResultDir, $ResultZip -ErrorAction Silentl
 New-Item -ItemType Directory -Force $JobDir, $ResultDir | Out-Null
 Expand-Archive -Force -Path (Join-Path $WorkDir $JobZip) -DestinationPath $JobDir
 
-if ($TrainTask -eq "detect") {
+if ($TrainTask -ne "classify") {
     $DataYaml = Join-Path $JobDir "dataset.yaml"
     $RemotePath = $JobDir.Replace("\", "/")
     (Get-Content $DataYaml) | ForEach-Object { if ($_ -match '^path:') { "path: $RemotePath" } else { $_ } } | Set-Content -Encoding UTF8 $DataYaml
@@ -690,7 +954,6 @@ def ensure_python_modules(py_cmd, modules: dict[str, str]) -> None:
 
 def train_local(args, dataset_path: Path, work: Path):
     py_cmd = build_env_cmd(args.conda_env, "python")
-    yolo_cmd = build_env_cmd(args.conda_env, "yolo")
     ensure_python_modules(py_cmd, {
         "torch": "torch",
         "torchvision": "torchvision",
@@ -701,8 +964,13 @@ def train_local(args, dataset_path: Path, work: Path):
         "onnxruntime": "onnxruntime-gpu",
         "yaml": "pyyaml",
     })
+    # Resolve yolo after the module check: pip may have just installed it into this env.
+    yolo_cmd = build_env_cmd(args.conda_env, "yolo")
+    print(f"YOLO_CMD={' '.join(yolo_cmd)}", flush=True)
 
 
+    if args.train_task == "pose" and "pose" not in Path(args.base_model).stem.lower():
+        print(f"warning=姿态训练建议使用 -pose 预训练权重（例如 yolov8n-pose.pt），当前 base_model={args.base_model}", flush=True)
     stop_signal = Path(args.stop_export_signal).resolve() if args.stop_export_signal else None
     if stop_signal and stop_signal.exists():
         stop_signal.unlink()
@@ -723,7 +991,7 @@ def train_local(args, dataset_path: Path, work: Path):
         "amp=False",
         f"device={args.train_device}",
     ]
-    if args.train_task == "detect":
+    if args.train_task in {"detect", "pose"}:
         train_args.append(f"imgsz={imgsz_arg(args)}")
     else:
         train_args.append(f"imgsz={max(args.img_width, args.img_height)}")
@@ -735,7 +1003,7 @@ def train_local(args, dataset_path: Path, work: Path):
     if not best_pt.exists():
         raise SystemExit(f"best.pt not found: {best_pt}")
 
-    export_size = imgsz_arg(args) if args.train_task == "detect" else max(args.img_width, args.img_height)
+    export_size = imgsz_arg(args) if args.train_task in {"detect", "pose"} else max(args.img_width, args.img_height)
     run(yolo_cmd + ["export", f"model={best_pt}", "format=onnx", f"imgsz={export_size}", "simplify=True", "opset=17", "dynamic=False"])
     best_onnx = best_pt.with_suffix(".onnx")
     if not best_onnx.exists():
@@ -761,6 +1029,23 @@ def run_train_stage(args):
             yolo_data,
             train_ratio_percent=args.train_ratio_percent,
         )
+    elif args.train_task == "pose":
+        labels_dir = Path(args.annotations_dir).resolve() if args.annotations_dir else dataset_root / "labels"
+        dataset_path, _ = prepare_pose_yolo(
+            images_dir,
+            labels_dir,
+            yolo_data,
+            kpt_count=args.kpt_count,
+            flip_idx=parse_int_list(args.flip_idx, "--flip-idx"),
+            kpt_sigmas=parse_float_list(args.kpt_sigmas, "--kpt-sigmas"),
+            class_names=args.pose_classes,
+            train_ratio_percent=args.train_ratio_percent,
+            img_width=args.img_width,
+            img_height=args.img_height,
+            resize_mode=args.image_resize_mode,
+            split_mode=args.split_mode,
+            val_groups=args.val_groups,
+        )
     else:
         annotations_dir = Path(args.annotations_dir).resolve() if args.annotations_dir else dataset_root / "annotations"
         dataset_path, _ = prepare_voc_yolo(
@@ -772,6 +1057,7 @@ def run_train_stage(args):
             img_height=args.img_height,
             resize_mode=args.image_resize_mode,
             split_mode=args.split_mode,
+            val_groups=args.val_groups,
         )
 
     best_pt, best_onnx = train_local(args, dataset_path, work)
@@ -811,8 +1097,12 @@ def build_parser(script_root: Path):
     ap.add_argument("--stage", choices=["train"], default="train")
     ap.add_argument("--dataset-root", default=str(script_root))
     ap.add_argument("--images-dir", default="")
-    ap.add_argument("--train-task", choices=["detect", "classify"], default="detect", help="训练任务：检测或图像分类")
-    ap.add_argument("--annotations-dir", default="")
+    ap.add_argument("--train-task", choices=["detect", "classify", "pose"], default="detect", help="训练任务：检测、图像分类或关键点姿态")
+    ap.add_argument("--annotations-dir", default="", help="检测：VOC XML 目录；姿态：YOLO pose txt 标注目录")
+    ap.add_argument("--kpt-count", type=int, default=0, help="姿态任务：每个目标的关键点数量")
+    ap.add_argument("--flip-idx", default="", help="姿态任务：左右翻转时的关键点对应关系，例如 1,0,3,2,4,5；留空则关闭翻转增强")
+    ap.add_argument("--kpt-sigmas", default="", help="姿态任务：可选的每个关键点 OKS sigma，逗号分隔")
+    ap.add_argument("--pose-classes", default="", help="姿态任务：类别名称，逗号分隔；留空时读取标注目录下 classes.txt")
     ap.add_argument("--train-ratio-percent", type=float, default=80.0, help="训练集占比，1 到 100；验证集占比自动为 100 减该值")
     ap.add_argument(
         "--split-mode",
@@ -820,6 +1110,7 @@ def build_parser(script_root: Path):
         default="video_group",
         help="检测数据划分方式：按视频前缀分组（推荐）或逐图片随机",
     )
+    ap.add_argument("--val-groups", default="", help="固定进入验证集的视频前缀，逗号分隔；留空则自动挑选。用于多轮训练保持验证集不变")
 
 
     ap.add_argument("--img-size", type=int, default=None, help="兼容旧调用：同时设置图片宽度和高度")
@@ -845,6 +1136,8 @@ def main():
     script_root = Path(__file__).resolve().parent
     args = build_parser(script_root).parse_args()
     validate_image_dimensions(args)
+    if args.train_task == "pose" and args.kpt_count < 1:
+        raise SystemExit("姿态训练需要 --kpt-count，例如 --kpt-count 6")
     run_train_stage(args)
 
 
